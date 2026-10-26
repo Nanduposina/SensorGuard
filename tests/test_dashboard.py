@@ -78,8 +78,28 @@ def test_profile_row_count_accepts_current_and_legacy_report_labels(tmp_path):
     assert profile_row_count(path) == 12_345
 
 
-def test_streamlit_smoke():
+def test_streamlit_smoke(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    pd.DataFrame(
+        {
+            "timestamp": ["2004-02-28 00:00:00"],
+            "sensor_id": [1],
+            "feature": ["temperature"],
+            "observed_value": [21.0],
+            "score": [0.9],
+            "predicted": [True],
+            "detector": ["rules"],
+            "reason": ["fixture alert"],
+            "severity": ["low"],
+        }
+    ).to_csv(experiment_dir / "clean_test_prediction_details.csv", index=False)
+    monkeypatch.setenv("SENSORGUARD_EXPERIMENT_DIR", str(experiment_dir))
+    monkeypatch.setenv("SENSORGUARD_DATA_PATH", str(tmp_path / "missing.txt"))
+    monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "missing-profile.md"))
+    monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "missing-models"))
 
     app = AppTest.from_file(
         Path(__file__).resolve().parents[1] / "app.py", default_timeout=20
