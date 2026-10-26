@@ -51,40 +51,59 @@ h1,h2,h3 { color: #17324d; letter-spacing: -0.02em; }
 PATHS = configured_paths()
 
 
+def cache_version(path: str | Path) -> tuple[int | None, int | None]:
+    """Invalidate cached reads when an artifact appears or changes on disk."""
+    try:
+        stat = Path(path).stat()
+    except OSError:
+        return None, None
+    return stat.st_mtime_ns, stat.st_size
+
+
 @st.cache_data(show_spinner=False, ttl=600)
-def cached_csv(path: str) -> pd.DataFrame:
+def cached_csv(path: str, version: tuple[int | None, int | None]) -> pd.DataFrame:
     return read_csv_optional(path)
 
 
 @st.cache_data(show_spinner="Reading the selected sensor from the source dataset…", ttl=1800)
-def cached_sensor(path: str, sensor_id: int, max_records: int = 5000) -> pd.DataFrame:
+def cached_sensor(
+    path: str, sensor_id: int, max_records: int, version: tuple[int | None, int | None]
+) -> pd.DataFrame:
     return load_sensor_records(path, sensor_id, max_records)
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def cached_profile_count(path: str):
+def cached_profile_count(path: str, version: tuple[int | None, int | None]):
     return profile_row_count(path)
 
 
 @st.cache_data(show_spinner=False, ttl=600)
-def cached_json(path: str):
+def cached_json(path: str, version: tuple[int | None, int | None]):
     return read_json_optional(path)
 
 
 def load_artifacts():
     exp = PATHS["experiment"]
+
+    def csv(name: str) -> pd.DataFrame:
+        path = exp / name
+        return cached_csv(str(path), cache_version(path))
+
     return {
-        "metrics": cached_csv(str(exp / "metrics.csv")),
-        "per_fault": cached_csv(str(exp / "per_fault_type.csv")),
-        "per_sensor": cached_csv(str(exp / "per_sensor.csv")),
-        "clean_alerts": cached_csv(str(exp / "clean_test_prediction_details.csv")),
-        "synthetic_alerts": cached_csv(str(exp / "prediction_details.csv")),
-        "clean_records": cached_csv(str(exp / "test_records.csv")),
-        "injected_records": cached_csv(str(exp / "injected_test_records.csv")),
-        "curves": cached_csv(str(exp / "precision_recall_curves.csv")),
-        "delays": cached_csv(str(exp / "detection_delay.csv")),
-        "candidates": cached_csv(str(exp / "historical_voltage_candidates.csv")),
-        "metadata": cached_json(str(exp / "experiment_metadata.json")),
+        "metrics": csv("metrics.csv"),
+        "per_fault": csv("per_fault_type.csv"),
+        "per_sensor": csv("per_sensor.csv"),
+        "clean_alerts": csv("clean_test_prediction_details.csv"),
+        "synthetic_alerts": csv("prediction_details.csv"),
+        "clean_records": csv("test_records.csv"),
+        "injected_records": csv("injected_test_records.csv"),
+        "curves": csv("precision_recall_curves.csv"),
+        "delays": csv("detection_delay.csv"),
+        "candidates": csv("historical_voltage_candidates.csv"),
+        "metadata": cached_json(
+            str(exp / "experiment_metadata.json"),
+            cache_version(exp / "experiment_metadata.json"),
+        ),
     }
 
 
@@ -106,7 +125,9 @@ def normalize_records(frame):
 def selected_records(sensor_id, artifacts, max_records=5000):
     if PATHS["data"].exists():
         try:
-            result = cached_sensor(str(PATHS["data"]), int(sensor_id), max_records)
+            result = cached_sensor(
+                str(PATHS["data"]), int(sensor_id), max_records, cache_version(PATHS["data"])
+            )
             if not result.empty:
                 return normalize_records(result), "bounded source sample"
         except Exception as exc:
@@ -156,7 +177,7 @@ def show_overview(a):
     sensor_count = (
         int(sensors.sensor_id.nunique()) if not sensors.empty and "sensor_id" in sensors else 0
     )
-    profile_count = cached_profile_count(str(PATHS["profile"]))
+    profile_count = cached_profile_count(str(PATHS["profile"]), cache_version(PATHS["profile"]))
     st.markdown(
         '<div class="sg-note">Dashboard views distinguish unmodified test-set detections from controlled synthetic fault experiments. Historical readings have no verified anomaly labels.</div>',
         unsafe_allow_html=True,

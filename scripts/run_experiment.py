@@ -90,6 +90,10 @@ def main():
     )
     historical = voltage_case_studies(frame)
     tables = {
+        # Reuse this bounded, unmodified chronological sample with the training
+        # CLI. Keeping it beside the evaluation artifacts makes the exact model
+        # input inspectable and avoids materializing the complete raw source.
+        "sampled_records": frame,
         "metrics": result["metrics"],
         "per_fault_type": result["per_fault"],
         "per_sensor": result["per_sensor"],

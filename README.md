@@ -54,7 +54,7 @@ The source is the [Intel Berkeley Research Lab sensor dataset](https://db.csail.
 
 The records contain date, time, per-sensor epoch sequence, mote ID, temperature, humidity, light and voltage. Epoch is not globally unique. The official page describes IDs 1–54 and notes that data from some motes may be missing or truncated. This local file contains all IDs 1–54, additional IDs 55–58, and isolated IDs 6485, 33117 and 65407. SensorGuard preserves these records and flags IDs outside the configured 1–54 range rather than forcing a 54-sensor count.
 
-The initial profile counted 93,879 rows as short because whitespace collapsing removed empty columns. The raw file uses repeated spaces for missing columns and five trailing spaces on a terminal block of 526 rows. Preserving literal spaces maps all 2,313,682 records to eight positional columns: 92,976 rows have blank light, 373 have blank temperature/humidity/light, four other rows have unusual IDs/blank positions, and the final 526 have blank mote ID and all measurement slots. These 526 rows form the contiguous file suffix. They remain unassigned to any sensor; their physical cause cannot be established from the file. Every row retains its raw text and line number. Explicit empty measurements remain missing values, not discarded rows. The full profile measures 2,312,781 temperature, 2,312,780 humidity, 2,219,804 light and 2,313,156 voltage values.
+The initial profile counted 93,879 rows as short because whitespace collapsing removed empty columns. The raw file uses repeated spaces for missing columns and five trailing spaces on a terminal block of 526 rows. Preserving literal spaces maps all 2,313,682 records to eight positional columns: 92,976 rows have blank light, 373 have blank temperature/humidity/light, four other rows have unusual IDs/blank positions, and the final 526 have blank mote ID and all measurement slots. These 526 rows form the contiguous file suffix. They remain unassigned to any sensor; their physical cause cannot be established from the file. Every row retains its raw text and line number. Explicit empty measurements remain missing values, not discarded rows. The full profile measures 2,312,781 temperature, 2,312,780 humidity, 2,219,804 light and 2,313,156 voltage values. The one-pass profiler also measures 0 repeated (timestamp, sensor ID) keys, 227,392 input-order reversals, and 231,380 consecutive per-sensor intervals over 300 seconds. Under the documented screening bounds, it flags 388,857 temperature, 299,084 humidity, 0 light and 1 voltage values; these are heuristic findings, not confirmed faults. The profiler records elapsed time and peak working set in its report. Out-of-range readings remain in the data.
 
 ## Reproduce the data pipeline
 
@@ -69,44 +69,60 @@ The parser and chunk reader are available from `sensorguard.ingestion`; `validat
 
 ## Train detectors and export alerts
 
+The training CLI materializes its input as a DataFrame. Do not pass the complete 2.3-million-row source on a memory-constrained machine. Instead, run the bounded experiment below; it saves the exact unmodified sample to `sampled_records.csv`. Then fit models and export predictions from that sample:
+
 ```powershell
-python scripts/run_detectors.py "data.txt/data.txt" `
-  --output artifacts/detections.csv `
-  --model-dir artifacts/models `
-  --epochs 30
+python scripts/run_detectors.py artifacts/all_sensors_250/sampled_records.csv `
+  --output artifacts/all_sensors_250/trained_predictions.csv `
+  --model-dir artifacts/all_sensors_250/models `
+  --epochs 3 `
+  --threshold-quantile 0.99
 ```
 
-Editable installation also provides the equivalent `sensorguard-detect` command.
-
-This convenience command currently materializes its input into a DataFrame before chronological splitting. For the 151 MB source and larger data, use the bounded streaming experiment runner below or prepare a documented subset; avoid running full-data model fitting on memory-constrained machines. Checkpoints and detections are generated under ignored artifact paths.
+The command saves `isolation_forest.joblib` and `autoencoder.pt`, and writes chronological test predictions. `sensorguard-detect` is the equivalent installed entry point. Missing values are imputed in model preprocessing; the source records and quality findings remain available in the sampled input.
 
 ## Controlled evaluation and metric meaning
 
-Run a deterministic bounded sample experiment (seed, sensor subset, per-sensor cap and epochs are configurable):
+Run a deterministic bounded sample experiment across every observed source ID. This includes IDs outside the official expected range; they are kept so the rule detector can surface them. Set the cap and epochs to fit available memory and runtime:
 
 ```powershell
+$sensorIds = (1..58) + @(6485, 33117, 65407)
+$sensors = $sensorIds -join ','
 python scripts/run_experiment.py `
   --input "data.txt/data.txt" `
-  --output-dir artifacts/experiment `
-  --sensors 1,2,3,4 `
-  --max-per-sensor 500 `
+  --output-dir artifacts/all_sensors_250 `
+  --sensors $sensors `
+  --max-per-sensor 250 `
   --seed 42 `
-  --epochs 12
+  --epochs 3
 ```
 
-The runner streams a bounded number of rows per selected sensor, chronologically partitions the sample, fits on unmodified training data, calibrates thresholds on the unmodified validation score distribution, and injects faults only into a copied test partition. “Unmodified” means no synthetic edits; it does not prove historical records are fault-free. The evaluation unit is a sensor-feature-reading pair (timestamp-only edits use a record marker). It reports precision, recall, F1, apparent false-positive rate, confusion counts, sample/event counts, PR curves for individual detectors, per-fault and per-sensor metrics, and delay for supported span faults. For controlled metrics, pairs without an injected label are treated as negatives; naturally occurring anomalies may therefore count as apparent false positives. Combined alerts are deduplicated per pair and scored as OR decisions; their maximum scores combine incomparable scales, so combined PR-AUC is undefined and omitted. The no-injection held-out scores are a baseline on unlabeled historical data, not a verified false-alarm rate.
+The runner scans the source, retains at most the first N source-order rows per requested ID, removes isolated records outside a two-day neighborhood around the selected sample median, and sorts the bounded sample chronologically. It fits on unmodified training data, calibrates model thresholds on the unmodified validation score distribution, and injects faults only into a copy of the held-out test partition. Unmodified does not mean verified fault-free. The evaluation unit is a sensor-feature-reading pair (timestamp-only edits use a record marker). Threshold calibration uses validation data only; final test labels are not used to fit or calibrate. It reports precision, recall, F1, apparent false-positive rate, confusion counts, sample/event counts, PR curves for individual detectors, per-fault and per-sensor metrics, and delay for supported span faults. Combined alerts are deduplicated per pair and scored as OR decisions; combined PR-AUC is omitted because detector score scales are incomparable.
 
-Synthetic labels are known because the experiment created those edits. Fault types, magnitudes and timing are experimenter-selected and do not represent natural prevalence or all real failure processes. Historical records have no verified anomaly labels. Voltage depends strongly on temperature according to the dataset documentation; candidate voltage trends are temperature-adjusted exploratory analyses. No battery failure is confirmed without independent battery/maintenance ground truth. Anomaly scores are not failure probabilities.
+The experiment directory contains `sampled_records.csv`, split/test records, injected observations and manifest, per-pair prediction details, detector metrics, no-injection alert baseline, per-fault and per-sensor tables, threshold metadata, voltage candidates, plots, and `experiment_report.md`. Treat no-injection alerts and controlled-test false positives as apparent rates: the historical source has no verified anomaly labels.
 
-### Example measured run
+### Latest measured full-source subset experiment
 
-The latest audit run used seed 42, sensors 1–4, a 100-record-per-sensor cap and two autoencoder epochs. After excluding 14 records outside the selected dense time window, it evaluated 386 sample rows (231 train, 77 validation, 78 test), 3 injected events and 11 positive feature-reading pairs out of 390 evaluated pairs. On the injected test, the all-detector OR had precision 0.052, recall 1.000 and apparent FPR 0.533; its no-injection test alert rate was 0.546. Individual rule, Isolation Forest and autoencoder no-injection alert rates were 0.285, 0.195 and 0.267. These non-injected pairs are unlabeled historical readings, so those rates are not verified error rates. This bounded experiment shows many alerts relative to the chosen injections and is not deployment-ready evidence. In this sample the voltage analysis marked one temperature-adjusted decline candidate and three abrupt-change candidates; these are unverified historical patterns, not battery failures.
+The full one-pass profile processed 2,313,682 rows in 78.47 seconds with a measured peak working set of 329.6 MiB on this Windows environment. The bounded evaluation scanned the source and selected up to 250 source-order records for each of the 61 observed IDs, then retained 12,977 rows in its dense time window (1,064 outside-window rows excluded). The chronological split was 7,786 train, 2,595 validation, and 2,596 test rows. It injected 3 events affecting 11 feature-reading pairs, evaluated 12,980 pairs, and completed the detector experiment in about 44 seconds; training/export on the saved sample took about 18 seconds. The saved evaluation threshold quantile was 0.99.
 
-Recreate the detailed tables and plots with the command above. The example report and outputs are local generated artifacts and are not checked into source control.
+| Detector | Precision | Recall | F1 | Apparent FPR | FP / FN |
+|---|---:|---:|---:|---:|---:|
+| Rules | 0.0023 | 1.0000 | 0.0045 | 0.3747 | 4,859 / 0 |
+| Isolation Forest | 0.0000 | 0.0000 | 0.0000 | 0.0631 | 818 / 11 |
+| Autoencoder | 0.0011 | 0.0909 | 0.0023 | 0.0673 | 873 / 10 |
+| Combined rules + IF + AE | 0.0020 | 1.0000 | 0.0039 | 0.4312 | 5,592 / 0 |
+
+The denominator is 12,980 feature-reading pairs with 11 injected positives. The very low precision reflects the sparse, experimenter-selected injections and large numbers of alerts; the combined system also flags many unlabelled pairs. In the rules output, numerous alerts are sensor-baseline deviations, and the broader sample includes IDs outside the configured expected set and out-of-range values. Do not interpret these apparent false positives as verified sensor faults, but do treat them as evidence that these thresholds are unsuitable for unattended alerting. On the unmodified held-out test subset, apparent alert rates were 0.374 for rules, 0.063 for Isolation Forest, 0.067 for the autoencoder, and 0.431 for the all-detector union. Historical battery patterns remain candidates only; temperature is correlated with voltage, and there is no independent failure ground truth.
+
+A smaller four-sensor smoke run (100 rows per ID, seed 42, two epochs) completed in about 30 seconds and produced 386 sample rows, 78 test rows, and the same 3 injected events. Generated artifacts are local under `artifacts/` and excluded from Git. These runs exercise the full detector workflow on a bounded sample, not model training over every raw record.
 
 ## Dashboard
 
 ```powershell
+$env:SENSORGUARD_DATA_PATH = "data.txt/data.txt"
+$env:SENSORGUARD_EXPERIMENT_DIR = "artifacts/all_sensors_250"
+$env:SENSORGUARD_PROFILE_PATH = "artifacts/data_profile.md"
+$env:SENSORGUARD_MODEL_DIR = "artifacts/all_sensors_250/models"
 streamlit run app.py
 ```
 

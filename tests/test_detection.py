@@ -3,6 +3,7 @@ import pandas as pd
 import pytest
 
 from sensorguard.autoencoder import AutoencoderDetector
+from sensorguard.cli import calibrate_isolation_threshold
 from sensorguard.detection import RESULT_COLUMNS, merge_alerts
 from sensorguard.evaluation import binary_metrics, chronological_split
 from sensorguard.isolation import IsolationForestDetector
@@ -113,3 +114,15 @@ def test_rule_training_baseline_and_context_baselines():
     assert "sensor_baseline_deviation" in " ".join(detector.predict(altered).reason)
     baselines = fit_contextual_baselines(df)
     assert (1, "temperature") in baselines
+
+
+def test_cli_isolation_cutoff_uses_validation_scores():
+    data = sample(40)
+    train, validation, _ = chronological_split(data, 0.6, 0.2)
+    detector = IsolationForestDetector(random_state=13, n_estimators=20).fit(train)
+    _, validation_scores = detector.score_samples(validation)
+    threshold = calibrate_isolation_threshold(detector, validation, 0.9)
+    assert threshold == pytest.approx(np.quantile(validation_scores, 0.9))
+    assert detector.threshold == threshold
+    with pytest.raises(ValueError, match="between 0 and 1"):
+        calibrate_isolation_threshold(detector, validation, 1.0)

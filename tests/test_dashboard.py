@@ -6,6 +6,7 @@ from sensorguard.dashboard_data import (
     align_context,
     confusion_counts,
     filter_alerts,
+    profile_row_count,
     sensor_summary,
 )
 
@@ -69,6 +70,14 @@ def test_confusion_counts():
     assert confusion_counts(rows, "rules") == {"tn": 1, "fp": 1, "fn": 1, "tp": 1}
 
 
+def test_profile_row_count_accepts_current_and_legacy_report_labels(tmp_path):
+    path = tmp_path / "profile.md"
+    path.write_text("- Rows parsed: 2,313,682\n", encoding="utf-8")
+    assert profile_row_count(path) == 2_313_682
+    path.write_text("- Rows: 12,345\n", encoding="utf-8")
+    assert profile_row_count(path) == 12_345
+
+
 def test_streamlit_smoke():
     from streamlit.testing.v1 import AppTest
 
@@ -86,6 +95,10 @@ def test_streamlit_smoke():
     ]:
         app.radio[0].set_value(page).run()
         assert not app.exception, f"Dashboard page {page!r} raised an exception"
+        if page == "Alert investigation":
+            download = app.get("download_button")[0]
+            assert download.label == "Export filtered alerts as CSV"
+            assert download.proto.url.endswith(".csv")
 
 
 def test_streamlit_empty_artifact_smoke(tmp_path, monkeypatch):

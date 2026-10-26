@@ -6,6 +6,7 @@ import argparse
 import json
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from .autoencoder import AutoencoderDetector
@@ -16,6 +17,19 @@ from .isolation import IsolationForestDetector
 from .rules import RuleDetector
 
 
+def calibrate_isolation_threshold(
+    detector: IsolationForestDetector, validation: pd.DataFrame, quantile: float
+) -> float:
+    """Set the Isolation Forest alert cutoff from validation scores only."""
+    if not 0.0 < quantile < 1.0:
+        raise ValueError("threshold quantile must be between 0 and 1")
+    _, scores = detector.score_samples(validation)
+    if len(scores) == 0:
+        raise ValueError("validation scores are empty")
+    detector.threshold = float(np.quantile(scores, quantile))
+    return detector.threshold
+
+
 def main() -> None:
     """Fit detectors on an early chronological split and write model artifacts."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -23,6 +37,7 @@ def main() -> None:
     parser.add_argument("--output", default="artifacts/detections.csv")
     parser.add_argument("--model-dir", default="artifacts/models")
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--threshold-quantile", type=float, default=0.99)
     args = parser.parse_args()
 
     source = Path(args.input)
@@ -37,6 +52,9 @@ def main() -> None:
     train, validation, test = chronological_split(frame)
 
     isolation_forest = IsolationForestDetector(random_state=42).fit(train)
+    isolation_threshold = calibrate_isolation_threshold(
+        isolation_forest, validation, args.threshold_quantile
+    )
     autoencoder = AutoencoderDetector(epochs=args.epochs).fit(train, validation=validation)
     model_dir = Path(args.model_dir)
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -59,6 +77,8 @@ def main() -> None:
                 "validation_rows": len(validation),
                 "test_rows": len(test),
                 "alerts": int(result.is_anomaly.sum()),
+                "threshold_quantile": args.threshold_quantile,
+                "isolation_forest_validation_threshold": isolation_threshold,
                 "output": str(target),
                 "model_dir": str(model_dir),
             }

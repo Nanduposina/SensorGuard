@@ -37,7 +37,7 @@ def read_csv_optional(path: str | Path) -> pd.DataFrame:
     if not p.exists() or p.stat().st_size == 0:
         return pd.DataFrame()
     try:
-        return pd.read_csv(p)
+        return pd.read_csv(p, low_memory=False)
     except (OSError, ValueError, pd.errors.ParserError):
         return pd.DataFrame()
 
@@ -58,7 +58,9 @@ def profile_row_count(path: str | Path) -> int | None:
     if not p.exists():
         return None
     match = re.search(
-        r"^- Rows: ([\d,]+)$", p.read_text(encoding="utf-8", errors="replace"), re.MULTILINE
+        r"^- Rows(?: parsed)?: ([\d,]+)$",
+        p.read_text(encoding="utf-8", errors="replace"),
+        re.MULTILINE,
     )
     return int(match.group(1).replace(",", "")) if match else None
 
