@@ -58,7 +58,8 @@ def inject_faults(
 
     Call only on the held-out test partition. `frame` is copied before changes.
     Labels mark directly modified feature-reading pairs; timestamp faults use feature
-    `record`. Neighboring unaffected observations remain explicitly negative.
+    `record`. Other observations remain unlabeled because the historical dataset has
+    no verified normal labels.
     """
     source = normalize_input(frame).reset_index(drop=True)
     derived = source.copy(deep=True)

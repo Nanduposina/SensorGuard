@@ -6,6 +6,7 @@ from sensorguard.dashboard_data import (
     align_context,
     confusion_counts,
     filter_alerts,
+    normalize_predictions,
     profile_row_count,
     sensor_summary,
 )
@@ -68,6 +69,21 @@ def test_confusion_counts():
         }
     )
     assert confusion_counts(rows, "rules") == {"tn": 1, "fp": 1, "fn": 1, "tp": 1}
+
+
+def test_dashboard_preserves_unknown_ground_truth_and_excludes_it_from_counts():
+    rows = normalize_predictions(
+        pd.DataFrame(
+            {
+                "detector": ["rules"] * 3,
+                "ground_truth": [True, None, False],
+                "predicted": [True, True, False],
+            }
+        )
+    )
+    assert rows.ground_truth.isna().sum() == 1
+    assert rows.ground_truth.dtype.name == "boolean"
+    assert confusion_counts(rows, "rules") == {"tn": 1, "fp": 0, "fn": 0, "tp": 1}
 
 
 def test_profile_row_count_accepts_current_and_legacy_report_labels(tmp_path):

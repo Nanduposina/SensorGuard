@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import auc, f1_score, precision_recall_curve, precision_score, recall_score
+from sklearn.metrics import precision_recall_curve
 
 from .autoencoder import AutoencoderDetector
 from .detection import merge_alerts, normalize_input
-from .evaluation import binary_metrics, chronological_split
+from .evaluation import chronological_split, partially_labeled_metrics
 from .injection import FaultSpec, inject_faults
 from .isolation import FEATURES, IsolationForestDetector
 from .rules import RuleDetector
@@ -37,6 +37,46 @@ def _scores_by_pair(output, frame, score_col="anomaly_score"):
     return output.groupby(["timestamp", "sensor_id", "feature"])[score_col].max()
 
 
+def _rule_subset(output: pd.DataFrame, *, quality_only: bool) -> pd.DataFrame:
+    """Select one interpretable rule family without dropping its source evidence."""
+    if output.empty or "rule_id" not in output:
+        return output.copy()
+    fixed_quality_ids = {"physical_limit", "duplicate_record", "out_of_order", "sampling_gap"}
+    rows = []
+    for row in output.itertuples(index=False):
+        rule_ids = str(row.rule_id).split("; ")
+        selected = [
+            rule_id
+            for rule_id in rule_ids
+            if (
+                rule_id in fixed_quality_ids
+                or rule_id.startswith(("missing_", "invalid_", "malformed_"))
+            )
+            == quality_only
+        ]
+        if not selected:
+            continue
+        row_data = row._asdict()
+        row_data["rule_id"] = "; ".join(selected)
+        if getattr(row, "reason", None):
+            reasons = str(row.reason).split("; ")
+            row_data["reason"] = "; ".join(
+                reason for reason in reasons if reason.split(":", 1)[0] in selected
+            )
+        if getattr(row, "explanation", None):
+            explanations = str(row.explanation).split("; ")
+            row_data["explanation"] = "; ".join(
+                explanation
+                for rule_id, explanation in zip(rule_ids, explanations)
+                if rule_id in selected
+            )
+        row_data["detector"] = (
+            "quality_rule_baseline" if quality_only else "statistical_rule_baseline"
+        )
+        rows.append(row_data)
+    return pd.DataFrame(rows, columns=output.columns)
+
+
 def evaluate_track(
     frame: pd.DataFrame,
     labels: pd.DataFrame | None = None,
@@ -48,9 +88,9 @@ def evaluate_track(
 ):
     """Fit on unmodified train, calibrate on unmodified validation, and test injections.
 
-    Evaluation unit is feature-reading pair. Missing or absent detector rows are treated
-    as negative predictions. Unmodified historical data is not verified fault-free, so
-    its no-injection alert rate is descriptive and its unlabeled pairs may include anomalies.
+    Evaluation unit is feature-reading pair. Only directly modified observations have
+    positive labels; all other historical pairs remain unknown. Their alert rate is
+    descriptive because natural anomalies may occur in the unmodified readings.
     """
     data = normalize_input(frame).reset_index(drop=True).sort_values("timestamp", kind="stable")
     train, val, test = chronological_split(data, 0.6, 0.2)
@@ -77,7 +117,7 @@ def evaluate_track(
     ]
     specs = [s for s in specs if s.duration > 0 and s.start_index + s.duration <= len(group)]
     injected = inject_faults(test, specs, seed=seed)
-    rules = RuleDetector().fit(train)
+    rules = RuleDetector().fit(train, val)
     iso = IsolationForestDetector(
         random_state=seed, n_estimators=n_estimators, contamination="auto"
     ).fit(train)
@@ -92,26 +132,35 @@ def evaluate_track(
     iso_cut = float(np.quantile(val_scores, threshold_quantile))
     iso.threshold = iso_cut
     # AE's threshold was calibrated exclusively on its unmodified validation partition.
+    rule_results = rules.predict(injected.frame)
     predictions = {
-        "rules": rules.predict(injected.frame),
+        "rules": rule_results,
         "isolation_forest": iso.predict(injected.frame),
         "autoencoder": ae.predict(injected.frame),
     }
+    predictions["quality_rule_baseline"] = _rule_subset(rule_results, quality_only=True)
+    predictions["statistical_rule_baseline"] = _rule_subset(rule_results, quality_only=False)
     predictions["combined_ml_if_ae"] = merge_alerts(
         predictions["isolation_forest"], predictions["autoencoder"]
     )
     predictions["combined_rules_if"] = merge_alerts(
         predictions["rules"], predictions["isolation_forest"]
     )
-    predictions["combined_rules_if_ae"] = merge_alerts(*predictions.values())
+    predictions["combined_rules_if_ae"] = merge_alerts(
+        predictions["rules"], predictions["isolation_forest"], predictions["autoencoder"]
+    )
     clean = {
         "rules": rules.predict(test),
         "isolation_forest": iso.predict(test),
         "autoencoder": ae.predict(test),
     }
+    clean["quality_rule_baseline"] = _rule_subset(clean["rules"], quality_only=True)
+    clean["statistical_rule_baseline"] = _rule_subset(clean["rules"], quality_only=False)
     clean["combined_ml_if_ae"] = merge_alerts(clean["isolation_forest"], clean["autoencoder"])
     clean["combined_rules_if"] = merge_alerts(clean["rules"], clean["isolation_forest"])
-    clean["combined_rules_if_ae"] = merge_alerts(*clean.values())
+    clean["combined_rules_if_ae"] = merge_alerts(
+        clean["rules"], clean["isolation_forest"], clean["autoencoder"]
+    )
     # Evaluate each feature-reading pair with stable modified timestamps.
     truth = {
         (r.timestamp, r.sensor_id, r.feature) for r in injected.labels.itertuples() if r.is_fault
@@ -134,7 +183,6 @@ def evaluate_track(
         type_by_pair[(r.timestamp, r.sensor_id, r.feature)] = r.fault_type
     metrics = []
     predictions_table = []
-    pr_curves = {}
     window_type = {}
     for fault in injected.fault_manifest.itertuples():
         features = fault.features.split(";")
@@ -162,9 +210,9 @@ def evaluate_track(
                     "severity": getattr(alert, "severity", "unrated"),
                     "rule_id": getattr(alert, "rule_id", ""),
                 }
-        y = np.array([key in truth for key in universe])
-        pred = np.array([decisions.get(key, False) for key in universe])
-        summary = binary_metrics(y, pred)
+        y = [True if key in truth else None for key in universe]
+        pred = [decisions.get(key, False) for key in universe]
+        summary = partially_labeled_metrics(y, pred)
         metrics.append(
             {
                 "detector": name,
@@ -173,15 +221,11 @@ def evaluate_track(
                 "fault_events": len(injected.fault_manifest),
                 "evaluated_records": len(injected.frame),
                 **summary,
-                # Combining unrelated score scales with max() does not yield
-                # a meaningful ranking, so PR-AUC is reported per detector.
-                "pr_auc": None
-                if name.startswith("combined_")
-                else _pr_auc(scores, truth, universe),
+                # Non-injected real readings have unknown labels, so ranking
+                # metrics and negative-class confusion counts are not defined.
+                "pr_auc": None,
             }
         )
-        if not name.startswith("combined_"):
-            pr_curves[name] = _pr_curve(scores, truth, universe)
         for key in universe:
             is_true = key in truth
             is_pred = decisions.get(key, False)
@@ -192,7 +236,7 @@ def evaluate_track(
                     "timestamp": key[0],
                     "sensor_id": key[1],
                     "feature": key[2],
-                    "ground_truth": is_true,
+                    "ground_truth": True if is_true else pd.NA,
                     "fault_type": type_by_pair.get(key),
                     "fault_window_type": window_type.get(key),
                     "predicted": is_pred,
@@ -203,11 +247,11 @@ def evaluate_track(
                     "rule_id": detail.get("rule_id", ""),
                 }
             )
-            if is_true != is_pred:
+            if is_true and not is_pred:
                 error_cases.append(
                     {
                         "detector": name,
-                        "error_type": "false_negative" if is_true else "false_positive",
+                        "error_type": "missed_injected_pair",
                         "timestamp": key[0],
                         "sensor_id": key[1],
                         "feature": key[2],
@@ -219,39 +263,59 @@ def evaluate_track(
     per_fault = []
     per_sensor = []
     pred_df = pd.DataFrame(predictions_table)
-    for (detector, ftype), g in pred_df[pred_df.fault_window_type.notna()].groupby(
-        ["detector", "fault_window_type"]
-    ):
-        yy = g.ground_truth.to_numpy(bool)
-        pp = g.predicted.to_numpy(bool)
-        per_fault.append(
-            {
-                "detector": detector,
-                "fault_type": ftype,
-                "fault_events": int((injected.fault_manifest.fault_type == ftype).sum()),
-                "evaluated_pairs": len(g),
-                "positive_pairs": int(yy.sum()),
-                "precision": float(precision_score(yy, pp, zero_division=0)),
-                "recall": float(recall_score(yy, pp, zero_division=0)),
-                "f1": float(f1_score(yy, pp, zero_division=0)),
-                "false_positives": int((~yy & pp).sum()),
+    for fault in injected.fault_manifest.itertuples():
+        observations = injected.observations[injected.observations.fault_id == fault.fault_id]
+        affected = {
+            (
+                row.timestamp_modified,
+                row.sensor_id,
+                "record" if row.feature == "timestamp" else row.feature,
+            )
+            for row in observations.itertuples()
+        }
+        for detector in predictions:
+            detector_rows = pred_df[pred_df.detector == detector]
+            decision = {
+                (row.timestamp, row.sensor_id, row.feature): bool(row.predicted)
+                for row in detector_rows.itertuples()
             }
-        )
+            detected = sum(decision.get(key, False) for key in affected)
+            per_fault.append(
+                {
+                    "detector": detector,
+                    "fault_id": fault.fault_id,
+                    "fault_type": fault.fault_type,
+                    "fault_events": 1,
+                    "injected_pairs": len(affected),
+                    "detected_injected_pairs": detected,
+                    "missed_injected_pairs": len(affected) - detected,
+                    "injection_recall": detected / len(affected) if affected else None,
+                    "event_detected": detected > 0,
+                }
+            )
     for (detector, sid), g in pred_df.groupby(["detector", "sensor_id"]):
-        yy = g.ground_truth.to_numpy(bool)
-        pp = g.predicted.to_numpy(bool)
-        positives = g[g.ground_truth]
+        known_positive = g.ground_truth.fillna(False).astype(bool)
+        unlabeled = g.ground_truth.isna()
+        detected_positive = int((known_positive & g.predicted).sum())
+        injected_pairs = int(known_positive.sum())
+        unknown_alerts = int((unlabeled & g.predicted).sum())
+        sensor_events = int((injected.fault_manifest.sensor_id == sid).sum())
         per_sensor.append(
             {
                 "detector": detector,
                 "sensor_id": sid,
-                "fault_events": int((injected.fault_manifest.sensor_id == sid).sum()),
+                "fault_events": sensor_events,
                 "evaluated_pairs": len(g),
-                "positive_pairs": len(positives),
-                "precision": float(precision_score(yy, pp, zero_division=0)),
-                "recall": float(recall_score(yy, pp, zero_division=0)),
-                "f1": float(f1_score(yy, pp, zero_division=0)),
-                "false_positives": int((~yy & pp).sum()),
+                "injected_pairs": injected_pairs,
+                "detected_injected_pairs": detected_positive,
+                "missed_injected_pairs": injected_pairs - detected_positive,
+                "injection_recall": detected_positive / injected_pairs if injected_pairs else None,
+                "unlabeled_pairs": int(unlabeled.sum()),
+                "total_alerts": int(g.predicted.sum()),
+                "alerts_on_unlabeled_pairs": unknown_alerts,
+                "unlabeled_alert_rate": unknown_alerts / int(unlabeled.sum())
+                if unlabeled.any()
+                else None,
             }
         )
     # No-injection held-out alert baseline; historical negatives are unverified.
@@ -272,12 +336,11 @@ def evaluate_track(
         clean_metrics.append(
             {
                 "detector": name,
-                "clean_test_pairs": n,
+                "unlabeled_test_pairs": n,
                 "evaluated_records": len(test),
                 "fault_events": 0,
-                "positive_pairs": 0,
-                "false_positives": int(dec.sum()),
-                "false_positive_rate": float(dec.sum() / n) if n else None,
+                "alerts_on_unlabeled_pairs": int(dec.sum()),
+                "unlabeled_alert_rate": float(dec.sum() / n) if n else None,
             }
         )
     clean_rows = []
@@ -303,7 +366,7 @@ def evaluate_track(
         "clean_prediction_details": clean_detail,
         "error_cases": pd.DataFrame(error_cases),
         "detection_delay": pd.DataFrame(delay),
-        "pr_curves": {k: v for k, v in pr_curves.items() if v is not None},
+        "pr_curves": {},
         "predictions": predictions,
         "clean_predictions": clean,
         "test_frame": test,
@@ -312,39 +375,15 @@ def evaluate_track(
             "isolation_forest_validation_quantile": threshold_quantile,
             "isolation_forest_threshold": iso_cut,
             "autoencoder_validation_threshold": ae.threshold,
+            "rule_sensor_deviation_validation_quantile": rules.config.sensor_deviation_validation_quantile,
+            "rule_sensor_deviation_thresholds": rules.sensor_deviation_thresholds,
+            "rule_baseline_scale_floors": rules.baseline_scale_floors,
         },
         "split_sizes": {"train": len(train), "validation": len(val), "test": len(test)},
         "training_range": [str(train.timestamp.min()), str(train.timestamp.max())],
         "validation_range": [str(val.timestamp.min()), str(val.timestamp.max())],
         "test_range": [str(test.timestamp.min()), str(test.timestamp.max())],
     }
-
-
-def _aligned_scores(scores, truth, universe):
-    if not truth:
-        return None, None
-    keys = list(universe)
-    y = np.array([k in truth for k in keys])
-    present = scores.to_dict() if not scores.empty else {}
-    floor = min(present.values()) - 1.0 if present else 0.0
-    return y, np.array([present.get(k, floor) for k in keys], dtype=float)
-
-
-def _pr_auc(scores, truth, universe):
-    y, s = _aligned_scores(scores, truth, universe)
-    if y is None or not y.any():
-        return None
-    p, r, _ = precision_recall_curve(y, s)
-    return float(auc(r, p))
-
-
-def _pr_curve(scores, truth, universe):
-    y, s = _aligned_scores(scores, truth, universe)
-    if y is None or not y.any():
-        return None
-    p, r, t = precision_recall_curve(y, s)
-    thresholds = np.append(t, np.nan)
-    return pd.DataFrame({"precision": p, "recall": r, "threshold": thresholds})
 
 
 def _detection_delays(pred, manifest):

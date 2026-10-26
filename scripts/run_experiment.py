@@ -54,6 +54,63 @@ def markdown_table(frame):
     )
 
 
+def alert_breakdowns(predictions):
+    """Count deduplicated alert pairs and individual rule contributions."""
+    alerts = predictions[predictions.predicted].drop_duplicates(
+        ["detector", "timestamp", "sensor_id", "feature"]
+    )
+    by_sensor_feature = (
+        alerts.groupby(["detector", "sensor_id", "feature"], as_index=False)
+        .size()
+        .rename(columns={"size": "alert_pairs"})
+    )
+    # Count distinct sensor-timestamp readings explicitly because multivariate
+    # detector scores are projected across feature rows for investigation.
+    reading_counts = []
+    for detector, group in alerts.groupby("detector", sort=True):
+        feature_pairs = group[["timestamp", "sensor_id", "feature"]].drop_duplicates().shape[0]
+        readings = group[["timestamp", "sensor_id"]].drop_duplicates().shape[0]
+        reading_counts.append(
+            {
+                "detector": detector,
+                "feature_alert_pairs": feature_pairs,
+                "unique_alerted_readings": readings,
+            }
+        )
+    by_detector_reading = pd.DataFrame(
+        reading_counts,
+        columns=["detector", "feature_alert_pairs", "unique_alerted_readings"],
+    )
+    by_detector_reading["feature_pairs_per_reading"] = (
+        by_detector_reading.feature_alert_pairs / by_detector_reading.unique_alerted_readings
+    )
+    rules = predictions[
+        predictions.detector.eq("rules") & predictions.predicted & predictions.rule_id.notna()
+    ]
+    contributions = []
+    for row in rules.itertuples():
+        for rule_id in str(row.rule_id).split("; "):
+            contributions.append(
+                {
+                    "rule_id": rule_id,
+                    "sensor_id": row.sensor_id,
+                    "feature": row.feature,
+                    "timestamp": row.timestamp,
+                }
+            )
+    rule_rows = pd.DataFrame(contributions)
+    if rule_rows.empty:
+        by_rule = pd.DataFrame(columns=["rule_id", "sensor_id", "feature", "alert_pairs"])
+    else:
+        by_rule = (
+            rule_rows.drop_duplicates(["rule_id", "sensor_id", "feature", "timestamp"])
+            .groupby(["rule_id", "sensor_id", "feature"], as_index=False)
+            .size()
+            .rename(columns={"size": "alert_pairs"})
+        )
+    return by_sensor_feature, by_rule, by_detector_reading
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--input", default="data.txt/data.txt")
@@ -88,6 +145,9 @@ def main():
         autoencoder_epochs=args.epochs,
         n_estimators=100,
     )
+    alert_breakdown, rule_breakdown, reading_alert_summary = alert_breakdowns(
+        result["prediction_details"]
+    )
     historical = voltage_case_studies(frame)
     tables = {
         # Reuse this bounded, unmodified chronological sample with the training
@@ -97,6 +157,9 @@ def main():
         "metrics": result["metrics"],
         "per_fault_type": result["per_fault"],
         "per_sensor": result["per_sensor"],
+        "alert_breakdown": alert_breakdown,
+        "rule_breakdown": rule_breakdown,
+        "reading_alert_summary": reading_alert_summary,
         "clean_baseline": result["clean_baseline"],
         "fault_manifest": result["fault_manifest"],
         "injection_observations": result["injection_observations"],
@@ -137,7 +200,7 @@ def main():
                 "validation_range": result["validation_range"],
                 "test_range": result["test_range"],
                 "evaluation_unit": "sensor-feature-reading pair including record marker",
-                "threshold_method": "Isolation Forest validation-score quantile; autoencoder aggregate validation reconstruction-error quantile; no injected labels used in calibration.",
+                "threshold_method": "Isolation Forest and autoencoder validation-score quantiles; per-feature robust rule-deviation quantiles using training-only scale floors; no injected labels used in calibration.",
             },
             indent=2,
             default=str,
@@ -149,13 +212,13 @@ def main():
     metrics = result["metrics"]
     fig, ax = plt.subplots(figsize=(9, 5))
     x = np.arange(len(metrics))
-    width = 0.24
-    for i, col in enumerate(["precision", "recall", "f1"]):
+    width = 0.32
+    for i, col in enumerate(["recall", "unlabeled_alert_rate"]):
         ax.bar(x + (i - 1) * width, metrics[col], width, label=col.title())
     ax.set_xticks(x, metrics.detector, rotation=25, ha="right")
     ax.set_ylim(0, 1)
     ax.set_ylabel("Score")
-    ax.set_title("Controlled injection detection (feature-reading pairs)")
+    ax.set_title("Known injected-pair recall and unlabeled alert rate")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out / "detector_comparison.png", dpi=300)
@@ -163,7 +226,7 @@ def main():
     if not result["per_fault"].empty:
         pivot = (
             result["per_fault"]
-            .pivot(index="fault_type", columns="detector", values="recall")
+            .pivot(index="fault_type", columns="detector", values="injection_recall")
             .fillna(0)
         )
         ax = pivot.plot(
@@ -206,19 +269,33 @@ def main():
         "",
         f"Seed: {args.seed}. Streamed up to the first {args.max_per_sensor} source-order records per requested sensor, then retained {len(frame):,} records within one day of the sample median timestamp (excluded {excluded_outside_dense_window} isolated records outside that dense window) and sorted chronologically. This bounded subset better preserves local sampling cadence than random thinning. Source data remains untouched.",
         f"Chronological partitions: {result['split_sizes']}. Training range: {result['training_range']}; validation: {result['validation_range']}; held-out test: {result['test_range']}.",
-        "Injected faults are applied only to a copy of the held-out test set. Rule and model fitting use unmodified training rows. Isolation Forest cutoff and autoencoder reconstruction threshold use the unmodified validation score distribution only. Unmodified does not mean verified fault-free because natural anomaly labels are unavailable.",
-        "Evaluation unit is the sensor-feature-reading pair; timestamp-only faults use the `record` feature marker for one reading. Missing predictions count as negative. Injected points have known ground truth; every unmodified pair is treated as negative for this controlled score, although natural anomalies may be present. Alert rows are reduced to one decision per pair before counting. Thus precision and FPR are relative to injected labels and FPR is apparent on unlabeled negatives. Combined systems use OR rules, but their detectors have incomparable score scales, so combined PR-AUC is not reported. Synthetic distributions do not represent natural failure prevalence or failure dynamics.",
+        "Injected faults are applied only to a copy of the held-out test set. Detector fitting uses unmodified training rows. Isolation Forest, autoencoder, and statistical-rule cutoffs are calibrated using unmodified validation score distributions only; injected labels are not used for fitting or calibration. A validation quantile is an operating-point choice on unlabeled data, not a claim that validation rows are normal.",
+        "Evaluation unit is the sensor-feature-reading pair; timestamp-only edits use a `record` marker. Only directly modified pairs have known positive labels. All other historical pairs remain unlabeled and are not called true negatives. Alert rows are deduplicated per detector and pair. Injected-pair recall and missed injected pairs are measurable, but precision, F1, false-positive rate, true negatives, and PR curves are not reported for this partly labeled test set. Alerts on unlabeled pairs are counted descriptively, not called false positives. Synthetic distributions do not represent natural failure prevalence or failure dynamics.",
         "Historical cases below are exploratory candidates from the observed records, not labeled faults. Voltage is regressed against temperature per sensor before estimating the residual time trend; this linear adjustment is not causal. Dataset documentation: https://db.csail.mit.edu/labdata/labdata.html.",
         "",
         "## Overall metrics",
         "",
         markdown_table(metrics),
         "",
-        "## Unmodified test alert baseline (unlabeled)",
+        "## Alerts on unmodified unlabeled test readings",
         "",
         markdown_table(result["clean_baseline"]),
         "",
-        "The unmodified subset has substantial apparent alert rates. These pairs have no injected labels, but they are not verified true negatives; natural anomalies can appear in this set. The combined union recovers more injected positives at the cost of more alerts. Treat the metrics as a diagnostic of this short sample and selected synthetic edits, not a deployable operating point or a verified historical FPR.",
+        "Unmodified pairs are unlabeled. Their alert counts and rates are descriptive only, not false positives or false-positive rates. Natural anomalies may be present. Treat these results as a diagnostic of this short sample and selected synthetic edits, not a deployable operating point.",
+        "## Alerts by sensor and feature",
+        "",
+        markdown_table(alert_breakdown),
+        "",
+        "## Rule contributions",
+        "",
+        "Rule contribution counts may overlap when multiple rules fire on one reading-feature pair.",
+        markdown_table(rule_breakdown),
+        "",
+        "## Feature alert pairs and distinct alerted readings",
+        "",
+        "Multivariate detector decisions are record-level scores projected to their present feature rows for investigation. Feature-pair counts can therefore exceed distinct sensor-timestamp readings; this table makes both counts explicit.",
+        markdown_table(reading_alert_summary),
+        "",
         "",
         "## Per-fault-type metrics",
         "",
@@ -251,7 +328,7 @@ def main():
         "",
         "No historical pattern is called a confirmed battery failure. Temperature, sensor load, environmental conditions, calibration drift, missing intervals, and data truncation are alternative explanations. Independent battery or maintenance ground truth is not available.",
         "",
-        "Synthetic fault injection enables measured recall against known edits but has a distribution mismatch: injected spans, amplitudes and fault types are chosen by the experimenter, whereas real failures can be gradual, correlated, intermittent, or absent from this dataset. No natural anomaly labels are inferred.",
+        "Synthetic fault injection enables measured detection recall against known edits but has a distribution mismatch: injected spans, amplitudes and fault types are chosen by the experimenter, whereas real failures can be gradual, correlated, intermittent, or absent from this dataset. No natural anomaly labels are inferred.",
         "",
     ]
     (out / "experiment_report.md").write_text("\n".join(report), encoding="utf-8")

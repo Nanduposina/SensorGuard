@@ -33,3 +33,12 @@ class SensorGuardConfig:
     constant_tolerance: float = 1e-9
     sensor_baseline_minimum_rows: int = 20
     sensor_deviation_z_threshold: float = 5.0
+    sensor_deviation_validation_quantile: float = 0.99
+    sensor_baseline_minimum_scale: dict[str, float] = field(
+        default_factory=lambda: {
+            "temperature": 0.05,
+            "humidity": 0.05,
+            "light": 1.0,
+            "voltage": 0.005,
+        }
+    )

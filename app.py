@@ -18,7 +18,6 @@ from sensorguard.dashboard_data import (
     FEATURES,
     align_context,
     configured_paths,
-    confusion_counts,
     filter_alerts,
     load_sensor_records,
     normalize_predictions,
@@ -93,6 +92,9 @@ def load_artifacts():
         "metrics": csv("metrics.csv"),
         "per_fault": csv("per_fault_type.csv"),
         "per_sensor": csv("per_sensor.csv"),
+        "alert_breakdown": csv("alert_breakdown.csv"),
+        "reading_alert_summary": csv("reading_alert_summary.csv"),
+        "rule_breakdown": csv("rule_breakdown.csv"),
         "clean_alerts": csv("clean_test_prediction_details.csv"),
         "synthetic_alerts": csv("prediction_details.csv"),
         "clean_records": csv("test_records.csv"),
@@ -582,26 +584,52 @@ def show_evaluation(a):
             "No metrics.csv was found. Run scripts/run_experiment.py to generate the evaluation artifacts.",
         )
     st.caption(
-        "Evaluation unit is a sensor-feature-reading pair, including a record marker for record-level rules. Missing prediction rows count as negative. No-injection pairs are treated as negative, but their natural anomaly status is unknown."
+        "Evaluation unit is a sensor-feature-reading pair, including a record marker for record-level rules. Only directly modified injected pairs have known labels. Unmodified historical pairs remain unlabeled; this page reports injected-pair recall and alerts on unlabeled pairs, not precision or verified false-positive rates."
     )
     chosen = st.selectbox(
         "Detector comparison", metrics.detector.tolist(), index=max(0, len(metrics) - 1)
     )
     row = metrics[metrics.detector == chosen].iloc[0]
-    cols = st.columns(5)
-    for col, key, label in zip(
-        cols,
-        ["precision", "recall", "f1", "false_positive_rate", "evaluated_pairs"],
-        ["Precision", "Recall", "F1", "Apparent false-positive rate", "Evaluated pairs"],
-    ):
-        col.metric(label, f"{row[key]:.3f}" if key != "evaluated_pairs" else f"{int(row[key]):,}")
+    metric_rows = [
+        ("recall", "Injected-pair recall", "rate"),
+        ("true_positives", "Injected pairs detected", "count"),
+        ("positive_pairs", "Known injected pairs", "count"),
+        (
+            "alerts_on_unlabeled_pairs"
+            if "alerts_on_unlabeled_pairs" in metrics
+            else "false_positives",
+            "Alerts outside injected pairs",
+            "count",
+        ),
+        (
+            "unlabeled_alert_rate" if "unlabeled_alert_rate" in metrics else "false_positive_rate",
+            "Unlabeled alert rate",
+            "rate",
+        ),
+    ]
+    cols = st.columns(len(metric_rows))
+    for col, (key, label, kind) in zip(cols, metric_rows):
+        value = row.get(key)
+        rendered = (
+            "n/a" if pd.isna(value) else f"{value:.3f}" if kind == "rate" else f"{int(value):,}"
+        )
+        col.metric(label, rendered)
     c1, c2 = st.columns(2)
     with c1:
+        metric_columns = ["recall"]
+        if "unlabeled_alert_rate" in metrics:
+            metric_columns.append("unlabeled_alert_rate")
+        elif "false_positive_rate" in metrics:
+            metric_columns.append("false_positive_rate")
         vals = metrics.melt(
-            id_vars="detector",
-            value_vars=["precision", "recall", "f1", "false_positive_rate"],
-            var_name="metric",
-            value_name="value",
+            id_vars="detector", value_vars=metric_columns, var_name="metric", value_name="value"
+        )
+        vals["metric"] = vals.metric.map(
+            {
+                "recall": "Injected-pair recall",
+                "unlabeled_alert_rate": "Unlabeled alert rate",
+                "false_positive_rate": "Legacy apparent alert rate",
+            }
         )
         st.plotly_chart(
             px.bar(
@@ -610,7 +638,7 @@ def show_evaluation(a):
                 y="value",
                 color="metric",
                 barmode="group",
-                title="Detector comparison",
+                title="Injected-pair recall and unlabeled alert rate",
                 range_y=[0, 1],
             ),
             width="stretch",
@@ -624,7 +652,7 @@ def show_evaluation(a):
                 px.bar(
                     fault,
                     x="fault_type",
-                    y="recall",
+                    y="injection_recall" if "injection_recall" in fault else "recall",
                     color="detector",
                     barmode="group",
                     range_y=[0, 1],
@@ -632,32 +660,31 @@ def show_evaluation(a):
                 ),
                 width="stretch",
             )
-    details = normalize_predictions(a["synthetic_alerts"])
-    if not details.empty:
-        counts = confusion_counts(details, chosen)
-        matrix = [[counts["tn"], counts["fp"]], [counts["fn"], counts["tp"]]]
-        fig = px.imshow(
-            matrix,
-            text_auto=True,
-            x=["Predicted no alert", "Predicted alert"],
-            y=["No injected fault label", "Injected fault"],
-            color_continuous_scale="Blues",
-            title=f"Confusion matrix · {chosen}",
+    st.info(
+        "Confusion matrices and precision-recall curves are withheld because unmodified readings have no verified negative labels. Inspect detector contributions and per-sensor results below."
+    )
+    if not a["per_sensor"].empty:
+        st.subheader("Per-sensor results")
+        st.dataframe(
+            a["per_sensor"][a["per_sensor"].detector == chosen],
+            width="stretch",
+            hide_index=True,
         )
-        st.plotly_chart(fig, width="stretch")
+    if not a["alert_breakdown"].empty:
+        st.subheader("Alerts by sensor and feature")
+        st.dataframe(
+            a["alert_breakdown"][a["alert_breakdown"].detector == chosen],
+            width="stretch",
+            hide_index=True,
+        )
+    if not a["reading_alert_summary"].empty:
         st.caption(
-            "Non-injected pairs are counted as negative for these synthetic metrics; historical anomalies are unlabeled and may be included."
+            "Multivariate scores may appear on multiple feature rows. This table separates feature-pair alert counts from distinct sensor-timestamp readings."
         )
-    curves = a["curves"]
-    if not curves.empty:
-        plot = curves[curves.detector == chosen]
-        if not plot.empty:
-            st.plotly_chart(
-                px.line(
-                    plot, x="recall", y="precision", title=f"Precision-recall curve · {chosen}"
-                ),
-                width="stretch",
-            )
+        st.dataframe(a["reading_alert_summary"], width="stretch", hide_index=True)
+    if chosen == "rules" and not a["rule_breakdown"].empty:
+        st.subheader("Rule contributions")
+        st.dataframe(a["rule_breakdown"], width="stretch", hide_index=True)
     if not a["per_fault"].empty:
         st.dataframe(a["per_fault"], width="stretch", hide_index=True)
     if not a["delays"].empty:

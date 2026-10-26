@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 
+from scripts.run_experiment import alert_breakdowns
 from sensorguard.experiment import evaluate_track
 from sensorguard.historical import voltage_case_studies
 from sensorguard.injection import FAULT_TYPES, FaultSpec, inject_faults
@@ -73,12 +74,25 @@ def test_complete_small_experiment():
         "rules",
         "isolation_forest",
         "autoencoder",
+        "quality_rule_baseline",
+        "statistical_rule_baseline",
         "combined_rules_if",
         "combined_ml_if_ae",
         "combined_rules_if_ae",
     }
     assert set(
-        ["precision", "recall", "f1", "false_positive_rate", "false_negatives", "pr_auc"]
+        [
+            "precision",
+            "recall",
+            "f1",
+            "false_positive_rate",
+            "false_negatives",
+            "false_positives",
+            "true_negatives",
+            "pr_auc",
+            "alerts_on_unlabeled_pairs",
+            "unlabeled_pairs",
+        ]
     ).issubset(result["metrics"].columns)
     assert (
         result["split_sizes"]["train"]
@@ -89,16 +103,27 @@ def test_complete_small_experiment():
     assert result["metrics"].evaluated_pairs.nunique() == 1
     assert (result["metrics"].evaluated_pairs == result["metrics"].evaluated_records * 5).all()
     assert result["metrics"].fault_events.eq(len(result["fault_manifest"])).all()
+    assert result["metrics"].precision.isna().all()
+    assert result["metrics"].false_positives.isna().all()
+    assert result["metrics"].true_negatives.isna().all()
+    assert result["metrics"].pr_auc.isna().all()
+    assert result["metrics"].labeled_pairs.eq(result["metrics"].positive_pairs).all()
     assert (
         result["metrics"]
-        .loc[result["metrics"].detector.str.startswith("combined_"), "pr_auc"]
-        .isna()
+        .unlabeled_pairs.eq(result["metrics"].evaluated_pairs - result["metrics"].positive_pairs)
         .all()
+    )
+    assert result["prediction_details"].ground_truth.isna().any()
+    assert result["prediction_details"].ground_truth.notna().sum() == (
+        result["metrics"].positive_pairs.iloc[0] * len(result["predictions"])
+    )
+    assert result["per_fault"].injected_pairs.sum() == (
+        result["metrics"].positive_pairs.iloc[0] * len(result["predictions"])
     )
     for output in result["predictions"].values():
         assert not output.duplicated(["timestamp", "sensor_id", "feature"]).any()
-    assert result["pr_curves"]
-    assert result["clean_baseline"].false_positive_rate.dropna().between(0, 1).all()
+    assert not result["pr_curves"]
+    assert result["clean_baseline"].unlabeled_alert_rate.dropna().between(0, 1).all()
     assert not result["clean_prediction_details"].empty
 
 
@@ -118,3 +143,23 @@ def test_constant_rule_emits_once_for_long_plateau():
     out = RuleDetector().predict(df[df.moteid == 1])
     constant = out[out.reason.str.contains("constant_reading")]
     assert len(constant) == 1
+
+
+def test_alert_breakdown_deduplicates_pairs_and_counts_readings():
+    predictions = pd.DataFrame(
+        [
+            {
+                "detector": "isolation_forest",
+                "timestamp": pd.Timestamp("2004-03-01"),
+                "sensor_id": 1,
+                "feature": feature,
+                "predicted": True,
+                "rule_id": None,
+            }
+            for feature in ("temperature", "humidity", "temperature")
+        ]
+    )
+    pairs, _, readings = alert_breakdowns(predictions)
+    assert pairs.alert_pairs.sum() == 2
+    assert readings.feature_alert_pairs.iloc[0] == 2
+    assert readings.unique_alerted_readings.iloc[0] == 1

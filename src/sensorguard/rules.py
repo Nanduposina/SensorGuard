@@ -19,11 +19,21 @@ class RuleDetector:
     def __init__(self, config: SensorGuardConfig | None = None):
         self.config = config or SensorGuardConfig()
         self.sensor_baselines = {}
+        self.baseline_scale_floors = {}
+        self.sensor_deviation_thresholds = {}
 
-    def fit(self, training: pd.DataFrame):
-        """Fit optional sensor-specific median/MAD baselines on training data only."""
+    def fit(self, training: pd.DataFrame, validation: pd.DataFrame | None = None):
+        """Fit sensor baselines on training and calibrate deviations on validation.
+
+        Nonzero sensor MAD scales provide training-derived floors for near-constant
+        sensors. This avoids assigning effectively infinite robust z-scores when a
+        sensor's short training sample happens to be constant. Validation readings
+        set one upper-tail score cutoff per feature; they are not treated as labeled
+        normal observations and no injected points are used for calibration.
+        """
         data = normalize_input(training)
         self.sensor_baselines = {}
+        raw_baselines = {}
         for sid, group in data.groupby("sensor_id"):
             for feature in FEATURES:
                 if feature not in group:
@@ -31,8 +41,47 @@ class RuleDetector:
                 values = pd.to_numeric(group[feature], errors="coerce").dropna()
                 if len(values) >= self.config.sensor_baseline_minimum_rows:
                     median = float(values.median())
-                    mad = float((values - median).abs().median())
-                    self.sensor_baselines[(sid, feature)] = (median, max(1.4826 * mad, 1e-6))
+                    scale = float(1.4826 * (values - median).abs().median())
+                    raw_baselines[(sid, feature)] = (median, scale)
+        self.baseline_scale_floors = {}
+        for feature in FEATURES:
+            observed_scales = [
+                scale
+                for (sid, name), (_, scale) in raw_baselines.items()
+                if name == feature and scale > self.config.sensor_baseline_minimum_scale[feature]
+            ]
+            self.baseline_scale_floors[feature] = max(
+                self.config.sensor_baseline_minimum_scale[feature],
+                float(np.median(observed_scales)) if observed_scales else 0.0,
+            )
+        self.sensor_baselines = {
+            key: (median, max(scale, self.baseline_scale_floors[key[1]]))
+            for key, (median, scale) in raw_baselines.items()
+        }
+        self.sensor_deviation_thresholds = {}
+        if validation is not None and len(validation):
+            if not 0 < self.config.sensor_deviation_validation_quantile < 1:
+                raise ValueError("sensor deviation validation quantile must be between 0 and 1")
+            val = normalize_input(validation)
+            scores = {feature: [] for feature in FEATURES}
+            for row in val.itertuples(index=False):
+                sid = getattr(row, "sensor_id")
+                for feature in FEATURES:
+                    baseline = self.sensor_baselines.get((sid, feature))
+                    value = getattr(row, feature, np.nan)
+                    if baseline is not None and pd.notna(value):
+                        center, scale = baseline
+                        scores[feature].append(abs(float(value) - center) / scale)
+            self.sensor_deviation_thresholds = {
+                feature: float(
+                    np.nextafter(
+                        np.quantile(values, self.config.sensor_deviation_validation_quantile),
+                        np.inf,
+                    )
+                )
+                for feature, values in scores.items()
+                if values
+            }
         return self
 
     def predict(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -59,8 +108,10 @@ class RuleDetector:
         for i, r in data.iterrows():
             sid, ts = r.sensor_id, r.timestamp
             issues = r.get("issues", [])
+            issue_codes = set()
             if isinstance(issues, (list, tuple)):
                 for issue in issues:
+                    issue_codes.add(str(issue))
                     feature = next((f for f in FEATURES if f in str(issue)), "record")
                     add(
                         ts,
@@ -73,7 +124,11 @@ class RuleDetector:
                         if str(issue).startswith(("invalid", "malformed", "suspicious"))
                         else "medium",
                     )
-            if pd.notna(sid) and int(sid) not in self.config.sensor_ids:
+            if (
+                pd.notna(sid)
+                and int(sid) not in self.config.sensor_ids
+                and "invalid_sensor_id" not in issue_codes
+            ):
                 add(
                     ts,
                     sid,
@@ -86,14 +141,18 @@ class RuleDetector:
             for f, bounds in self.config.physical_limits.items():
                 value = r.get(f, np.nan)
                 if pd.isna(value):
-                    add(
-                        ts,
-                        sid,
-                        f,
-                        np.nan,
-                        "missing_measurement",
-                        f"{f} measurement is missing or unparsable.",
+                    has_specific_issue = any(
+                        f"{prefix}_{f}" in issue_codes for prefix in ("missing", "invalid")
                     )
+                    if not has_specific_issue:
+                        add(
+                            ts,
+                            sid,
+                            f,
+                            np.nan,
+                            "missing_measurement",
+                            f"{f} measurement is missing or unparsable.",
+                        )
                 elif not bounds[0] <= float(value) <= bounds[1]:
                     add(
                         ts,
@@ -108,14 +167,17 @@ class RuleDetector:
                 if pd.notna(value) and baseline:
                     center, scale = baseline
                     z = abs(float(value) - center) / scale
-                    if z >= self.config.sensor_deviation_z_threshold:
+                    threshold = self.sensor_deviation_thresholds.get(
+                        f, self.config.sensor_deviation_z_threshold
+                    )
+                    if z >= threshold:
                         add(
                             ts,
                             sid,
                             f,
                             value,
                             "sensor_baseline_deviation",
-                            f"Deviation from training sensor median {center:.5g} exceeds robust z threshold {self.config.sensor_deviation_z_threshold}.",
+                            f"Deviation from training sensor median {center:.5g} has robust z {z:.5g}, above {threshold:.5g} (validation quantile {self.config.sensor_deviation_validation_quantile:.3g} when available).",
                             "medium",
                             z,
                         )
@@ -220,7 +282,9 @@ class RuleDetector:
                         )
         if not found:
             return empty_results()
-        findings = pd.DataFrame(found)
+        findings = pd.DataFrame(found).drop_duplicates(
+            subset=["timestamp", "sensor_id", "feature", "rule_id"]
+        )
         # A reading-feature has one alert; all firing rules remain attached as evidence.
         return (
             findings.groupby(["timestamp", "sensor_id", "feature"], dropna=False, as_index=False)

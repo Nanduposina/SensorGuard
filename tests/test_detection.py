@@ -5,7 +5,7 @@ import pytest
 from sensorguard.autoencoder import AutoencoderDetector
 from sensorguard.cli import calibrate_isolation_threshold
 from sensorguard.detection import RESULT_COLUMNS, merge_alerts
-from sensorguard.evaluation import binary_metrics, chronological_split
+from sensorguard.evaluation import binary_metrics, chronological_split, partially_labeled_metrics
 from sensorguard.isolation import IsolationForestDetector
 from sensorguard.rules import RuleDetector, contextual_deviations
 
@@ -53,6 +53,24 @@ def test_rules_and_context_causal_overlap():
     assert set(RESULT_COLUMNS).issubset(ctx.columns)
 
 
+def test_rule_detector_emits_one_missing_measurement_finding_per_pair():
+    row = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2004-01-01")],
+            "sensor_id": [1],
+            "temperature": [20.0],
+            "humidity": [40.0],
+            "light": [np.nan],
+            "voltage": [2.7],
+            "issues": [["missing_light"]],
+        }
+    )
+    result = RuleDetector().predict(row)
+    light = result[result.feature == "light"]
+    assert len(light) == 1
+    assert light.rule_id.iloc[0] == "missing_light"
+
+
 def test_merge_and_chronological_split():
     df = sample()
     tr, va, te = chronological_split(df)
@@ -76,6 +94,23 @@ def test_binary_metrics_counts_and_undefined_false_positive_rate():
     assert no_negative_class["recall"] == 0.5
     with pytest.raises(ValueError, match="equally sized"):
         binary_metrics([1], [0, 1])
+
+
+def test_partially_labeled_metrics_do_not_call_unmodified_pairs_negative():
+    got = partially_labeled_metrics([True, None, None], [True, True, False])
+    assert got["true_positives"] == 1
+    assert got["false_negatives"] == 0
+    assert got["alerts_on_unlabeled_pairs"] == 1
+    assert got["unlabeled_pairs"] == 2
+    assert got["recall"] == 1
+    assert got["precision"] is got["f1"] is got["false_positive_rate"] is None
+    assert got["false_positives"] is got["true_negatives"] is None
+
+    complete = partially_labeled_metrics([True, False], [True, True])
+    assert complete["precision"] == 0.5
+    assert complete["recall"] == 1
+    assert complete["f1"] == pytest.approx(2 / 3)
+    assert complete["false_positive_rate"] == 1
 
 
 def test_autoencoder_model_fit_predict_serialize():
@@ -114,6 +149,20 @@ def test_rule_training_baseline_and_context_baselines():
     assert "sensor_baseline_deviation" in " ".join(detector.predict(altered).reason)
     baselines = fit_contextual_baselines(df)
     assert (1, "temperature") in baselines
+
+
+def test_rule_deviation_cutoffs_use_training_scales_and_validation_only():
+    df = sample(50)
+    train, validation, test = chronological_split(df, 0.6, 0.2)
+    detector = RuleDetector().fit(train, validation)
+    original_thresholds = detector.sensor_deviation_thresholds.copy()
+    assert set(original_thresholds) == {"temperature", "humidity", "light", "voltage"}
+    assert detector.baseline_scale_floors["voltage"] >= 0.005
+    altered_test = test.copy()
+    altered_test["voltage"] = 5.0
+    detector.predict(altered_test)
+    assert detector.sensor_deviation_thresholds == original_thresholds
+    assert original_thresholds["voltage"] < 1_000
 
 
 def test_cli_isolation_cutoff_uses_validation_scores():

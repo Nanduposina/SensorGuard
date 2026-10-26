@@ -99,7 +99,19 @@ def normalize_predictions(frame: pd.DataFrame) -> pd.DataFrame:
         data["score"] = data["anomaly_score"]
     for col in ("ground_truth", "predicted", "is_anomaly"):
         if col in data:
-            data[col] = data[col].astype(str).str.lower().isin(["true", "1", "yes"])
+            values = (
+                data[col]
+                .astype("string")
+                .str.lower()
+                .map(
+                    {"true": True, "1": True, "yes": True, "false": False, "0": False, "no": False}
+                )
+            )
+            data[col] = (
+                values.astype("boolean")
+                if col == "ground_truth"
+                else values.fillna(False).astype(bool)
+            )
     for col in ("score", "anomaly_score", "observed_value"):
         if col in data:
             data[col] = pd.to_numeric(data[col], errors="coerce")
@@ -238,7 +250,7 @@ def align_context(
 
 
 def confusion_counts(rows: pd.DataFrame, detector: str) -> dict[str, int]:
-    """Return pair-level binary confusion counts for one detector."""
+    """Return counts for explicitly labeled pairs only for one detector."""
     data = normalize_predictions(rows)
     if data.empty:
         return {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
@@ -246,7 +258,8 @@ def confusion_counts(rows: pd.DataFrame, detector: str) -> dict[str, int]:
     data = data[data[column] == detector]
     if not {"ground_truth", "predicted"}.issubset(data):
         return {"tn": 0, "fp": 0, "fn": 0, "tp": 0}
-    truth = data.ground_truth
+    data = data[data.ground_truth.notna()]
+    truth = data.ground_truth.fillna(False)
     pred = data.predicted
     return {
         "tn": int((~truth & ~pred).sum()),
