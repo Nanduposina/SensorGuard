@@ -8,6 +8,10 @@ data/
 *.parquet
 artifacts/
 generated/
+.sensorguard/
+*.sqlite
+*.sqlite3
+*.db
 
 # Model artifacts and checkpoints
 models/

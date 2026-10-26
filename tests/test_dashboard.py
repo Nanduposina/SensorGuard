@@ -116,6 +116,7 @@ def test_streamlit_smoke(tmp_path, monkeypatch):
     monkeypatch.setenv("SENSORGUARD_DATA_PATH", str(tmp_path / "missing.txt"))
     monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "missing-profile.md"))
     monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "missing-models"))
+    monkeypatch.setenv("SENSORGUARD_REVIEW_STORE", str(tmp_path / "reviews.sqlite3"))
 
     app = AppTest.from_file(
         Path(__file__).resolve().parents[1] / "app.py", default_timeout=20
@@ -126,15 +127,18 @@ def test_streamlit_smoke(tmp_path, monkeypatch):
         "Overview",
         "Sensor explorer",
         "Alert investigation",
+        "Alert review",
         "Model evaluation",
         "Sensor health",
     ]:
-        app.radio[0].set_value(page).run()
+        app.radio(key="workspace_navigation").set_value(page).run()
         assert not app.exception, f"Dashboard page {page!r} raised an exception"
         if page == "Alert investigation":
             download = app.get("download_button")[0]
             assert download.label == "Export filtered alerts as CSV"
             assert download.proto.url.endswith(".csv")
+        if page == "Alert review":
+            assert app.get("download_button")[-1].label == "Download review backup (JSON)"
 
 
 def test_streamlit_empty_artifact_smoke(tmp_path, monkeypatch):
@@ -146,14 +150,110 @@ def test_streamlit_empty_artifact_smoke(tmp_path, monkeypatch):
     monkeypatch.setenv("SENSORGUARD_EXPERIMENT_DIR", str(tmp_path / "no-results"))
     monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "no-profile.md"))
     monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "no-models"))
+    monkeypatch.setenv("SENSORGUARD_REVIEW_STORE", str(tmp_path / "no-reviews.sqlite3"))
     app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run()
     assert not app.exception
     for page in [
         "Overview",
         "Sensor explorer",
         "Alert investigation",
+        "Alert review",
         "Model evaluation",
         "Sensor health",
     ]:
-        app.radio[0].set_value(page).run()
+        app.radio(key="workspace_navigation").set_value(page).run()
         assert not app.exception, f"Empty-state page {page!r} raised an exception"
+
+
+def test_alert_review_streamlit_saves_and_updates_decision(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    pd.DataFrame(
+        {
+            "timestamp": ["2004-02-28 00:00:00", "2004-02-28 00:00:00"],
+            "sensor_id": [1, 1],
+            "feature": ["temperature", "temperature"],
+            "observed_value": [21.0, 21.0],
+            "score": [0.9, 0.9],
+            "predicted": [True, True],
+            "detector": ["rules", "rules"],
+            "reason": ["fixture alert", "fixture alert"],
+            "severity": ["medium", "medium"],
+        }
+    ).to_csv(experiment_dir / "clean_test_prediction_details.csv", index=False)
+    review_path = tmp_path / "feedback" / "reviews.sqlite3"
+    monkeypatch.setenv("SENSORGUARD_EXPERIMENT_DIR", str(experiment_dir))
+    monkeypatch.setenv("SENSORGUARD_DATA_PATH", str(tmp_path / "missing.txt"))
+    monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "missing-profile.md"))
+    monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "missing-models"))
+    monkeypatch.setenv("SENSORGUARD_REVIEW_STORE", str(review_path))
+
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run()
+    app.radio(key="workspace_navigation").set_value("Alert review").run()
+    assert not app.exception
+    assert "1 matching reviewable alert" in " ".join(item.value for item in app.caption)
+    app.radio(key="review_decision").set_value("confirmed_anomaly").run()
+    app.text_area(key="review_notes").set_value("Checked against lab notes.")
+    app.button(key="save_review").click().run()
+    assert not app.exception
+
+    from sensorguard.review_store import ReviewStore
+
+    stored = ReviewStore(review_path).list_reviews()
+    assert len(stored) == 1
+    assert stored[0]["label"] == "confirmed_anomaly"
+    assert stored[0]["notes"] == "Checked against lab notes."
+
+    app.radio(key="review_decision").set_value("normal_behavior").run()
+    app.button(key="save_review").click().run()
+    assert not app.exception
+    stored = ReviewStore(review_path).list_reviews()
+    assert len(stored) == 1
+    assert stored[0]["label"] == "normal_behavior"
+
+
+def test_model_evaluation_shows_matched_human_review_summary(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    from sensorguard.review_store import ReviewStore
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    alert = {
+        "timestamp": "2004-02-28 00:00:00",
+        "sensor_id": 1,
+        "feature": "temperature",
+        "observed_value": 21.0,
+        "score": 0.9,
+        "anomaly_score": 0.9,
+        "predicted": True,
+        "detector": "rules",
+        "experiment_detector": "rules",
+        "reason": "fixture alert",
+        "severity": "medium",
+    }
+    pd.DataFrame([alert]).to_csv(experiment_dir / "clean_test_prediction_details.csv", index=False)
+    pd.DataFrame(
+        {
+            "detector": ["rules"],
+            "recall": [None],
+            "true_positives": [0],
+            "positive_pairs": [0],
+            "alerts_on_unlabeled_pairs": [1],
+            "unlabeled_alert_rate": [0.1],
+        }
+    ).to_csv(experiment_dir / "metrics.csv", index=False)
+    store_path = tmp_path / "reviews.sqlite3"
+    ReviewStore(store_path).save_review(alert, "confirmed_anomaly", "Independent review")
+    monkeypatch.setenv("SENSORGUARD_EXPERIMENT_DIR", str(experiment_dir))
+    monkeypatch.setenv("SENSORGUARD_DATA_PATH", str(tmp_path / "missing.txt"))
+    monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "missing-profile.md"))
+    monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "missing-models"))
+    monkeypatch.setenv("SENSORGUARD_REVIEW_STORE", str(store_path))
+
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run()
+    app.radio(key="workspace_navigation").set_value("Model evaluation").run()
+    assert not app.exception
+    assert any(metric.label == "Confirmed anomaly" and metric.value == "1" for metric in app.metric)

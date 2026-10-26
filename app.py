@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import sys
 from datetime import datetime, time
 from pathlib import Path
@@ -25,6 +26,16 @@ from sensorguard.dashboard_data import (
     read_csv_optional,
     read_json_optional,
     sensor_summary,
+)
+from sensorguard.review_store import (
+    LABEL_TITLES,
+    LABELS,
+    ReviewConflictError,
+    ReviewImportError,
+    ReviewStore,
+    export_reviews,
+    prepare_review_alerts,
+    reviewed_alert_summary,
 )
 
 st.set_page_config(
@@ -578,6 +589,26 @@ def show_evaluation(a):
         unsafe_allow_html=True,
     )
     metrics = a["metrics"]
+    try:
+        reviews = ReviewStore(PATHS["reviews"]).list_reviews()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        reviews = []
+        st.warning(f"Human review feedback could not be loaded: {exc}")
+    feedback = reviewed_alert_summary(a["clean_alerts"], reviews)
+    with st.expander("Independently reviewed alert feedback", expanded=False):
+        st.caption(
+            "This summary matches human reviews to the current unmodified alert artifact by stable alert ID. It describes reviewed alerts only; review selection is not random and it is not a held-out model accuracy estimate. Uncertain reviews are excluded from the binary confirmation rate."
+        )
+        cols = st.columns(4)
+        cols[0].metric("Matched reviews", feedback["matched_reviews"])
+        cols[1].metric("Confirmed anomaly", feedback["confirmed_anomaly"])
+        cols[2].metric("Normal behavior", feedback["normal_behavior"])
+        cols[3].metric("Uncertain", feedback["uncertain"])
+        rate = feedback["reviewed_alert_confirmation_rate"]
+        st.metric("Reviewed-alert confirmation rate", "n/a" if rate is None else f"{rate:.1%}")
+        st.caption(
+            f"Binary reviewed sample: {feedback['binary_reviewed']} alerts. Current alerts: {feedback['current_alerts']}; stored reviews unmatched to this artifact: {feedback['unmatched_stored_reviews']}. This rate is not recall and does not estimate dataset-wide precision."
+        )
     if metrics.empty:
         return empty_message(
             "Evaluation unavailable",
@@ -710,6 +741,202 @@ def show_evaluation(a):
     )
 
 
+def show_review(a):
+    """Collect and manage reviewer labels independently of model artifacts."""
+    st.title("Alert review")
+    st.markdown(
+        '<div class="sg-note">Review unmodified historical alerts using independent evidence. Labels are stored separately and never retrain detectors or change thresholds.</div>',
+        unsafe_allow_html=True,
+    )
+    raw_alerts = normalize_predictions(a["clean_alerts"])
+    alerts, invalid = prepare_review_alerts(raw_alerts)
+    try:
+        store = ReviewStore(PATHS["reviews"])
+        saved = store.list_reviews()
+    except (OSError, sqlite3.Error, ValueError) as exc:
+        st.error(f"The local review store is unavailable: {exc}")
+        return
+    saved_by_id = {review["alert_id"]: review for review in saved}
+
+    if invalid:
+        st.warning(
+            f"{invalid} alert row(s) could not be reviewed because identity fields were missing or invalid."
+        )
+    if alerts.empty:
+        empty_message(
+            "No reviewable alerts",
+            "No predicted rows were found in the unmodified alert artifact. Run the experiment to generate alert details. Synthetic-injection predictions are intentionally excluded from human historical review.",
+        )
+    else:
+        alerts["review_status"] = alerts.alert_id.map(
+            lambda alert_id: saved_by_id.get(alert_id, {}).get("label", "unreviewed")
+        )
+        c = st.columns([1, 1, 1, 1.5])
+        sensors = sorted(int(value) for value in alerts.sensor_id.dropna().unique())
+        sensor_filter = c[0].multiselect("Sensor", sensors, key="review_sensor_filter")
+        detector_col = "detector_group" if "detector_group" in alerts else "detector"
+        detectors = sorted(alerts[detector_col].dropna().astype(str).unique())
+        detector_filter = c[1].multiselect("Detector", detectors, key="review_detector_filter")
+        features = sorted(alerts.feature.dropna().astype(str).unique())
+        feature_filter = c[2].multiselect("Feature", features, key="review_feature_filter")
+        status_filter = c[3].selectbox(
+            "Review status",
+            ["All", "Unreviewed", *[LABEL_TITLES[label] for label in LABELS]],
+            key="review_status_filter",
+        )
+        search = st.text_input("Search explanation or alert ID", key="review_search")
+        filtered = alerts
+        if sensor_filter:
+            filtered = filtered[filtered.sensor_id.isin(sensor_filter)]
+        if detector_filter:
+            filtered = filtered[filtered[detector_col].astype(str).isin(detector_filter)]
+        if feature_filter:
+            filtered = filtered[filtered.feature.astype(str).isin(feature_filter)]
+        if status_filter == "Unreviewed":
+            filtered = filtered[filtered.review_status == "unreviewed"]
+        elif status_filter != "All":
+            wanted = next(label for label in LABELS if LABEL_TITLES[label] == status_filter)
+            filtered = filtered[filtered.review_status == wanted]
+        if search:
+            explanation = filtered.get(
+                "explanation", filtered.get("reason", pd.Series("", index=filtered.index))
+            )
+            mask = filtered.alert_id.str.contains(
+                search, case=False, na=False
+            ) | explanation.astype(str).str.contains(search, case=False, na=False)
+            filtered = filtered[mask]
+        st.caption(
+            f"{len(filtered):,} matching reviewable alert(s); {len(saved):,} review record(s) in local store."
+        )
+        table_cols = [
+            col
+            for col in [
+                "alert_id",
+                "timestamp",
+                "sensor_id",
+                "feature",
+                "observed_value",
+                detector_col,
+                "anomaly_score",
+                "score",
+                "severity",
+                "reason",
+                "explanation",
+                "review_status",
+            ]
+            if col in filtered
+        ]
+        if filtered.empty:
+            st.info("No alerts match these filters.")
+        else:
+            st.dataframe(filtered[table_cols].head(100), width="stretch", hide_index=True)
+            if len(filtered) > 100:
+                st.caption(
+                    "Showing the first 100 matching alerts. Use filters or search to narrow the list."
+                )
+            choices = filtered.reset_index(drop=True)
+
+            def alert_label(index):
+                row = choices.iloc[index]
+                return (
+                    f"{row.timestamp} · sensor {int(row.sensor_id)} · {row.feature} · "
+                    f"{row.get(detector_col, 'unknown')} · {row.alert_id[:16]}"
+                )
+
+            selected = st.selectbox(
+                "Select alert to review",
+                range(len(choices)),
+                format_func=alert_label,
+                key="review_alert_selection",
+            )
+            row = choices.iloc[selected]
+            prior = saved_by_id.get(row.alert_id)
+            st.subheader("Selected alert details")
+            cols = st.columns(5)
+            cols[0].metric("Sensor ID", str(int(row.sensor_id)))
+            cols[1].metric("Timestamp", str(row.timestamp))
+            cols[2].metric("Feature / value", f"{row.feature} / {row.get('observed_value', 'n/a')}")
+            cols[3].metric("Detector", str(row.get(detector_col, "unknown")))
+            score = row.get("anomaly_score")
+            if score is None or pd.isna(score):
+                score = row.get("score")
+            cols[4].metric(
+                "Score / severity",
+                str(score if pd.notna(score) else row.get("severity", "n/a")),
+            )
+            explanation = row.get("explanation")
+            if explanation is None or pd.isna(explanation):
+                explanation = row.get("reason", "No explanation available.")
+            st.write("**Explanation:**", explanation)
+            st.code(row.alert_id, language=None)
+            if prior:
+                st.info(
+                    f"Current saved decision: {LABEL_TITLES[prior['label']]} · {prior['reviewed_at']}"
+                )
+            default_index = LABELS.index(prior["label"]) if prior else None
+            decision = st.radio(
+                "Reviewer classification",
+                LABELS,
+                index=default_index,
+                format_func=lambda label: LABEL_TITLES[label],
+                key="review_decision",
+            )
+            notes = st.text_area(
+                "Optional notes",
+                value=(prior["notes"] or "") if prior else "",
+                key="review_notes",
+            )
+            if st.button("Save review decision", type="primary", key="save_review"):
+                if decision is None:
+                    st.error("Choose a classification before saving.")
+                else:
+                    try:
+                        saved_review = store.save_review(row.to_dict(), decision, notes)
+                        st.session_state["review_save_feedback"] = (
+                            f"Saved {LABEL_TITLES[saved_review['label']]} for alert {saved_review['alert_id'][:16]}."
+                        )
+                        st.rerun()
+                    except (OSError, sqlite3.Error, ValueError) as exc:
+                        st.error(f"Review could not be saved: {exc}")
+    if "review_save_feedback" in st.session_state:
+        st.success(st.session_state.pop("review_save_feedback"))
+
+    st.divider()
+    st.subheader("Export or import review data")
+    st.caption(f"Local review store: {PATHS['reviews']}")
+    st.download_button(
+        "Download review backup (JSON)",
+        data=export_reviews(saved),
+        file_name="sensorguard_reviews.json",
+        mime="application/json",
+        key="export_reviews",
+    )
+    upload = st.file_uploader(
+        "Import a SensorGuard review JSON", type=["json"], key="review_upload"
+    )
+    overwrite = st.checkbox(
+        "Allow imported records to overwrite existing reviews with matching alert IDs",
+        value=False,
+        key="review_import_overwrite",
+    )
+    if st.button("Import review file", key="import_reviews"):
+        if upload is None:
+            st.error("Choose a JSON review export first.")
+        else:
+            try:
+                result = store.import_reviews(upload.getvalue(), overwrite=overwrite)
+                st.success(
+                    f"Imported {result['imported']} new review(s) and updated {result['overwritten']} existing review(s)."
+                )
+                st.rerun()
+            except ReviewConflictError as exc:
+                st.error(
+                    str(exc) + ". Confirm overwrite only if replacing these decisions is intended."
+                )
+            except (ReviewImportError, OSError, sqlite3.Error) as exc:
+                st.error(f"Review import rejected; no records were written: {exc}")
+
+
 def show_health(a):
     st.title("Sensor health")
     records = normalize_records(a["clean_records"])
@@ -780,13 +1007,23 @@ with st.sidebar:
     st.title("SensorGuard")
     page = st.radio(
         "Workspace",
-        ["Overview", "Sensor explorer", "Alert investigation", "Model evaluation", "Sensor health"],
+        [
+            "Overview",
+            "Sensor explorer",
+            "Alert investigation",
+            "Alert review",
+            "Model evaluation",
+            "Sensor health",
+        ],
         label_visibility="collapsed",
+        key="workspace_navigation",
     )
     st.divider()
     st.caption("Artifact configuration")
     st.code(f"data: {PATHS['data']}\nresults: {PATHS['experiment']}", language=None)
-    st.caption("Override with SENSORGUARD_DATA_PATH and SENSORGUARD_EXPERIMENT_DIR.")
+    st.caption(
+        "Override paths with SENSORGUARD_DATA_PATH, SENSORGUARD_EXPERIMENT_DIR and SENSORGUARD_REVIEW_STORE."
+    )
 
 if page == "Overview":
     show_overview(a)
@@ -794,6 +1031,8 @@ elif page == "Sensor explorer":
     show_explorer(a)
 elif page == "Alert investigation":
     show_alerts(a)
+elif page == "Alert review":
+    show_review(a)
 elif page == "Model evaluation":
     show_evaluation(a)
 else:

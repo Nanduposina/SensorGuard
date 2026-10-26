@@ -28,6 +28,9 @@ def configured_paths() -> dict[str, Path]:
             os.getenv("SENSORGUARD_PROFILE_PATH", root / "artifacts" / "data_profile.md")
         ),
         "models": Path(os.getenv("SENSORGUARD_MODEL_DIR", root / "artifacts" / "models")),
+        "reviews": Path(
+            os.getenv("SENSORGUARD_REVIEW_STORE", root / ".sensorguard" / "reviews.sqlite3")
+        ),
     }
 
 
