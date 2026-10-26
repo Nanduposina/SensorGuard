@@ -1,0 +1,45 @@
+# Raw datasets and derived data
+data.txt/
+data.txt.gz
+data/
+*.txt
+*.gz
+*.zip
+*.parquet
+artifacts/
+generated/
+
+# Model artifacts and checkpoints
+models/
+checkpoints/
+*.joblib
+*.pt
+*.pth
+*.pkl
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Environments and local configuration
+.venv/
+venv/
+env/
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
