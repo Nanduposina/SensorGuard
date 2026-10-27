@@ -38,6 +38,8 @@ from sensorguard.review_store import (
     reviewed_alert_summary,
 )
 
+px.defaults.template = "plotly_white"
+
 st.set_page_config(
     page_title="SensorGuard | Sensor quality",
     page_icon="SG",
@@ -48,9 +50,12 @@ st.markdown(
     """
 <style>
 .stApp { background: #f5f7fa; color: #172b4d; }
-[data-testid="stSidebar"] { background: #edf2f7; border-right: 1px solid #dbe3ec; }
+[data-testid="stHeader"] { background: #f5f7fa; }
+[data-testid="stSidebar"] { background: #edf2f7; border-right: 1px solid #dbe3ec; color: #172b4d; }
+[data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span { color: #172b4d !important; }
 h1,h2,h3 { color: #17324d; letter-spacing: -0.02em; }
-[data-testid="stMetric"] { background: white; border: 1px solid #dbe3ec; padding: 14px 16px; border-radius: 10px; }
+[data-testid="stMetric"] { background: white; border: 1px solid #dbe3ec; padding: 14px 16px; border-radius: 10px; color: #172b4d; }
+[data-testid="stMetricLabel"], [data-testid="stMetricValue"], [data-testid="stMetricDelta"] { color: #172b4d !important; }
 .sg-note { background: #eaf3f7; border-left: 4px solid #168c8c; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
 .sg-warn { background: #fff5e5; border-left: 4px solid #d58c22; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
 </style>

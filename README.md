@@ -1,8 +1,12 @@
 # SensorGuard
 
-SensorGuard is a reproducible data-quality and anomaly-investigation pipeline for the Intel Berkeley Research Lab sensor dataset. It keeps malformed and suspicious readings auditable, evaluates detectors against controlled synthetic faults, and provides an interactive Streamlit dashboard. The historical data is unlabeled: naturally occurring patterns are candidates for investigation, not verified failures.
+[![CI](https://github.com/Nanduposina/SensorGuard/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Nanduposina/SensorGuard/actions/workflows/ci.yml)
 
-CI runs on pushes and pull requests through [GitHub Actions](./.github/workflows/ci.yml). A repository-specific badge can be added after publishing this folder to a known GitHub owner/repository.
+**Catch questionable sensor data before it reaches a model.**
+
+SensorGuard is a reproducible quality and anomaly-investigation pipeline for the [Intel Berkeley Research Lab sensor dataset](https://db.csail.mit.edu/labdata/labdata.html). It streams and profiles source records, preserves evidence for malformed or suspicious readings, compares rule checks with an Isolation Forest and a PyTorch autoencoder, and presents findings in a Streamlit dashboard with local human review.
+
+The Intel deployment documents 54 expected mote IDs. The local source file contains 61 observed IDs; SensorGuard retains and flags unexpected IDs rather than forcing the data to match the expected count. Historical Intel readings are unlabeled. Detector alerts are investigation candidates, not verified failures.
 
 ## What it does
 
@@ -23,8 +27,9 @@ flowchart LR
   Quality --> Profile[Profile and clean export]
   Quality --> Split[Chronological train / validation / test]
   Split --> Rules[Rule checks]
-  Split --> IF[Isolation Forest]
-  Split --> AE[PyTorch autoencoder]
+  Split --> Context[Optional physical-neighbor context<br/>coordinates + backward time alignment]
+  Context --> IF[Isolation Forest]
+  Context --> AE[PyTorch autoencoder]
   Split --> Inject[Seeded faults on test copy]
   Rules --> Merge[Evidence-preserving alert merge]
   IF --> Merge
@@ -36,6 +41,40 @@ flowchart LR
   Review --> Backup[Validated JSON backup / restore]
 ```
 
+## Results at a glance
+
+### Controlled Intel Lab fault injection
+
+The bounded demo used seed 42, sensor IDs 1 through 4, up to 100 source-order rows per sensor, and two autoencoder epochs. Its test unit is a sensor-feature-reading pair. It contains 11 deliberately modified pairs and 379 unmodified but **unlabeled** pairs.
+
+| Detector | Injected pairs detected | Alerts among 379 unlabeled pairs | Unlabeled alert rate |
+|---|---:|---:|---:|
+| Rules | 11 / 11 | 80 | 21.1% |
+| Isolation Forest | 6 / 11 | 134 | 35.4% |
+| Autoencoder | 6 / 11 | 93 | 24.5% |
+| Combined rules + Isolation Forest + autoencoder | 11 / 11 | 213 | 56.2% |
+
+Only the injected pairs have known labels. Alerts among the other pairs are descriptive alert counts, not false positives; precision, F1, and false-positive rate are therefore not calculated for this run. Results depend on this bounded sample and injected fault design.
+
+### Separate published EV battery-fault benchmark
+
+This evaluation uses a different dataset and scores one result per held-out vehicle. The brand 3 subset has 9 source-labelled fault vehicles and 91 source-labelled normal vehicles; the test split contains 9 fault-labelled and 18 normal-labelled vehicles.
+
+| Detector | Fault-labelled vehicles detected | Normal-labelled vehicles flagged | Precision | Recall | Vehicle-level false-positive rate |
+|---|---:|---:|---:|---:|---:|
+| Isolation Forest | 0 / 9 | 0 / 18 | 0.000 | 0.000 | 0.000 |
+| Autoencoder | 4 / 9 | 4 / 18 | 0.500 | 0.444 | 0.222 |
+
+These are vehicle-level outcomes, not charging-session or reading-level metrics. Normal labels apply to vehicles as a whole and do not certify every reading as normal. This benchmark does not validate faults in Intel Lab motes. Full label provenance, thresholds, splits, confusion counts, and limitations are in [the resume-claim audit](./docs/RESUME_CLAIM_AUDIT.md).
+
+## Dashboard screenshots
+
+These screenshots were captured from the running Streamlit application with generated experiment and evaluation artifacts:
+
+![SensorGuard overview](./docs/images/dashboard-overview-final.jpg)
+
+![Model evaluation, with synthetic and historical labels distinguished](./docs/images/dashboard-evaluation-final.jpg)
+
 ## Requirements and setup
 
 Python 3.10 or newer and Git are required. The clean demo below was verified with Python 3.12.10 on Windows; CI runs Python 3.11 on Linux. PowerShell is used for the documented Windows commands. Install the package and development/dashboard tools from the repository root:
@@ -45,6 +84,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
 python -m pip install -e ".[dev,dashboard]"
+python -m pip check
 python -m pytest -q
 ```
 
@@ -59,6 +99,73 @@ The source is the [Intel Berkeley Research Lab sensor dataset](https://db.csail.
 The records contain date, time, per-sensor epoch sequence, mote ID, temperature, humidity, light and voltage. Epoch is not globally unique. The official page describes IDs 1–54 and notes that data from some motes may be missing or truncated. This local file contains all IDs 1–54, additional IDs 55–58, and isolated IDs 6485, 33117 and 65407. SensorGuard preserves these records and flags IDs outside the configured 1–54 range rather than forcing a 54-sensor count.
 
 The initial profile counted 93,879 rows as short because whitespace collapsing removed empty columns. The raw file uses repeated spaces for missing columns and five trailing spaces on a terminal block of 526 rows. Preserving literal spaces maps all 2,313,682 records to eight positional columns: 92,976 rows have blank light, 373 have blank temperature/humidity/light, four other rows have unusual IDs/blank positions, and the final 526 have blank mote ID and all measurement slots. These 526 rows form the contiguous file suffix. They remain unassigned to any sensor; their physical cause cannot be established from the file. Every row retains its raw text and line number. Explicit empty measurements remain missing values, not discarded rows. The full profile measures 2,312,781 temperature, 2,312,780 humidity, 2,219,804 light and 2,313,156 voltage values. The one-pass profiler also measures 0 repeated (timestamp, sensor ID) keys, 227,392 input-order reversals, and 231,380 consecutive per-sensor intervals over 300 seconds. Under the documented screening bounds, it flags 388,857 temperature, 299,084 humidity, 0 light and 1 voltage values; these are heuristic findings, not confirmed faults. The profiler records elapsed time and peak working set in its report. Out-of-range readings remain in the data.
+
+## Fresh-clone workflow (Windows PowerShell)
+
+Download the [Intel Lab source](https://db.csail.mit.edu/labdata/labdata.html) and place the original `data.txt` at `data.txt/data.txt`. Run these commands from the repository root after installing the development and dashboard extras above. A unique run name keeps generated files out of the source tree and prevents accidental overwrites.
+
+```powershell
+$python = ".\.venv\Scripts\python.exe"
+$run = "portfolio-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+$sensors = (1..54) -join ","
+
+# Stream a profile to Markdown.
+& $python scripts/profile_dataset.py "data.txt/data.txt" --output "artifacts/$run/data_profile.md"
+
+# Clean the complete source with non-destructive flag-and-retain defaults.
+& $python scripts/clean_dataset.py "data.txt/data.txt" --output-dir "artifacts/$run/cleaning" --chunk-size 50000
+
+# Run the seeded, chronological experiment with physical-neighbor context.
+& $python scripts/run_experiment.py `
+  --input "data.txt/data.txt" `
+  --output-dir "artifacts/$run/experiment" `
+  --sensors $sensors `
+  --max-per-sensor 150 `
+  --seed 42 `
+  --epochs 2 `
+  --contextual `
+  --peer-radius-meters 8 `
+  --peer-minimum 3 `
+  --peer-tolerance 120s
+```
+
+The full cleaning export requires about 2.7 GB for the two CSV files; a previous Windows run took about 7 minutes 33 seconds and used approximately 300 MiB working set. Runtime depends on storage and hardware. Use `--max-rows 20000` for a bounded cleaning smoke run; that does not replace full-data cleaning.
+
+### Optional published EV battery benchmark
+
+The separate [Figshare record](https://doi.org/10.6084/m9.figshare.23659323) provides the 55 MB `battery_brand3.tar.gz` archive. Download and extract it once; it is not required for the Intel Lab experiment or CI.
+
+```powershell
+$evRoot = Join-Path $env:TEMP "$run-ev-data"
+New-Item -ItemType Directory -Force -Path $evRoot | Out-Null
+$archive = Join-Path $evRoot "battery_brand3.tar.gz"
+Invoke-WebRequest -Uri "https://ndownloader.figshare.com/files/41519169" -OutFile $archive
+tar -xzf $archive -C $evRoot
+$evData = Join-Path $evRoot "battery_brand3"
+
+& $python scripts/evaluate_real_battery.py $evData `
+  --archive $archive `
+  --output-dir "artifacts/$run/real-battery" `
+  --seed 42 `
+  --epochs 20 `
+  --estimators 200 `
+  --threshold-quantile 0.95
+```
+
+The expected extracted layout is `battery_brand3/label/all_label.csv`, `battery_brand3/data/*.pkl`, and `battery_brand3/column.pkl`. The run reports vehicle-level metrics; the source does not supply per-reading ground truth.
+
+### Start the dashboard
+
+```powershell
+$env:SENSORGUARD_DATA_PATH = "data.txt/data.txt"
+$env:SENSORGUARD_PROFILE_PATH = "artifacts/$run/data_profile.md"
+$env:SENSORGUARD_EXPERIMENT_DIR = "artifacts/$run/experiment"
+$env:SENSORGUARD_REAL_BATTERY_EVAL_DIR = "artifacts/$run/real-battery"
+$env:SENSORGUARD_REVIEW_STORE = ".sensorguard/$run.sqlite3"
+& $python -m streamlit run app.py
+```
+
+Open the local URL printed by Streamlit. Stop the dashboard with `Ctrl+C`. If the optional EV run was skipped, the Model evaluation page explains that no real battery artifact is configured. Outputs under `artifacts/` and the local review store are ignored by Git.
 
 ## Reproduce the data pipeline
 
