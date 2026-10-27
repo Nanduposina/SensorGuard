@@ -21,6 +21,7 @@ class RuleDetector:
         self.sensor_baselines = {}
         self.baseline_scale_floors = {}
         self.sensor_deviation_thresholds = {}
+        self.contextual_thresholds = {}
 
     def fit(self, training: pd.DataFrame, validation: pd.DataFrame | None = None):
         """Fit sensor baselines on training and calibrate deviations on validation.
@@ -59,6 +60,7 @@ class RuleDetector:
             for key, (median, scale) in raw_baselines.items()
         }
         self.sensor_deviation_thresholds = {}
+        self.contextual_thresholds = {}
         if validation is not None and len(validation):
             if not 0 < self.config.sensor_deviation_validation_quantile < 1:
                 raise ValueError("sensor deviation validation quantile must be between 0 and 1")
@@ -82,6 +84,20 @@ class RuleDetector:
                 for feature, values in scores.items()
                 if values
             }
+            for feature in FEATURES:
+                column = f"{feature}_peer_robust_z"
+                if column in val:
+                    values = pd.to_numeric(val[column], errors="coerce").dropna()
+                    if not values.empty:
+                        self.contextual_thresholds[feature] = float(
+                            np.nextafter(
+                                np.quantile(
+                                    values,
+                                    self.config.sensor_deviation_validation_quantile,
+                                ),
+                                np.inf,
+                            )
+                        )
         return self
 
     def predict(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -181,6 +197,28 @@ class RuleDetector:
                             "medium",
                             z,
                         )
+                peer_z = pd.to_numeric(
+                    pd.Series([r.get(f"{f}_peer_robust_z", np.nan)]), errors="coerce"
+                ).iloc[0]
+                peer_count = r.get(f"{f}_peer_count", 0)
+                peer_threshold = self.contextual_thresholds.get(f)
+                if (
+                    pd.notna(peer_z)
+                    and peer_threshold is not None
+                    and pd.notna(peer_count)
+                    and int(peer_count) >= self.config.minimum_peer_sensors
+                    and float(peer_z) >= peer_threshold
+                ):
+                    add(
+                        ts,
+                        sid,
+                        f,
+                        value,
+                        "peer_context_deviation",
+                        f"Deviation from {int(peer_count)} prior peer sensors has training-baseline-adjusted robust z {float(peer_z):.5g}, above the validation-only cutoff {peer_threshold:.5g}; local conditions may be legitimate.",
+                        "low",
+                        float(peer_z),
+                    )
             if bool(r.get("duplicate", False)):
                 add(
                     ts,

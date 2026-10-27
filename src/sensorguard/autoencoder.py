@@ -7,6 +7,7 @@ import random
 import numpy as np
 import pandas as pd
 
+from .context import CONTEXT_FEATURES
 from .detection import RESULT_COLUMNS, empty_results, normalize_input
 from .isolation import FEATURES
 
@@ -26,6 +27,7 @@ class AutoencoderDetector:
         threshold=None,
         patience=10,
         device="cpu",
+        use_contextual_features=False,
     ):
         self.hidden_dims = tuple(hidden_dims)
         self.epochs = epochs
@@ -36,7 +38,9 @@ class AutoencoderDetector:
         self.threshold = threshold
         self.patience = patience
         self.device = device
+        self.use_contextual_features = use_contextual_features
         self.features = []
+        self.measurement_features = []
         self.medians = None
         self.means = None
         self.stds = None
@@ -57,7 +61,15 @@ class AutoencoderDetector:
     def _matrix(self, frame, fit=False):
         data = normalize_input(frame).reset_index(drop=True)
         if fit:
-            self.features = [f for f in FEATURES if f in data]
+            self.measurement_features = [f for f in FEATURES if f in data]
+            self.features = list(self.measurement_features)
+            if self.use_contextual_features:
+                context_features = [f for f in CONTEXT_FEATURES if f in data]
+                if not context_features:
+                    raise ValueError(
+                        "contextual features were enabled but not supplied to the frame"
+                    )
+                self.features.extend(context_features)
         x = (
             data[self.features]
             .apply(pd.to_numeric, errors="coerce")
@@ -176,7 +188,8 @@ class AutoencoderDetector:
         cutoff = self.threshold if threshold is None else threshold
         rows = []
         for i, r in data.iterrows():
-            for j, f in enumerate(self.features):
+            for f in self.measurement_features:
+                j = self.features.index(f)
                 if pd.notna(r[f]):
                     rows.append(
                         {
@@ -200,6 +213,7 @@ class AutoencoderDetector:
                 "state_dict": self.model.state_dict(),
                 "hidden_dims": self.hidden_dims,
                 "features": self.features,
+                "measurement_features": self.measurement_features,
                 "medians": self.medians,
                 "means": self.means,
                 "stds": self.stds,
@@ -213,6 +227,7 @@ class AutoencoderDetector:
                     "threshold_quantile": self.threshold_quantile,
                     "patience": self.patience,
                     "device": self.device,
+                    "use_contextual_features": self.use_contextual_features,
                 },
             },
             path,
@@ -224,6 +239,9 @@ class AutoencoderDetector:
         payload = torch.load(path, map_location=map_location, weights_only=False)
         obj = cls(hidden_dims=payload["hidden_dims"], **payload["params"])
         obj.features = payload["features"]
+        obj.measurement_features = payload.get(
+            "measurement_features", [name for name in obj.features if name in FEATURES]
+        )
         obj.medians = payload["medians"]
         obj.means = payload["means"]
         obj.stds = payload["stds"]

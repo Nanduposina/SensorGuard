@@ -113,6 +113,8 @@ def load_artifacts():
         "curves": csv("precision_recall_curves.csv"),
         "delays": csv("detection_delay.csv"),
         "candidates": csv("historical_voltage_candidates.csv"),
+        "voltage_windows": csv("historical_voltage_windows.csv"),
+        "contextual_coverage": csv("contextual_coverage.csv"),
         "metadata": cached_json(
             str(exp / "experiment_metadata.json"),
             cache_version(exp / "experiment_metadata.json"),
@@ -606,8 +608,10 @@ def show_evaluation(a):
         cols[3].metric("Uncertain", feedback["uncertain"])
         rate = feedback["reviewed_alert_confirmation_rate"]
         st.metric("Reviewed-alert confirmation rate", "n/a" if rate is None else f"{rate:.1%}")
+        normal_share = feedback["reviewed_alert_normal_share"]
+        normal_share_text = "n/a" if normal_share is None else f"{normal_share:.1%}"
         st.caption(
-            f"Binary reviewed sample: {feedback['binary_reviewed']} alerts. Current alerts: {feedback['current_alerts']}; stored reviews unmatched to this artifact: {feedback['unmatched_stored_reviews']}. This rate is not recall and does not estimate dataset-wide precision."
+            f"Binary reviewed sample: {feedback['binary_reviewed']} matched alerts; normal-labelled share: {normal_share_text}. Current alerts: {feedback['current_alerts']}; stored reviews unmatched to this artifact: {feedback['unmatched_stored_reviews']}. Reviewable observations are selected predicted alerts, so this share is not a false-positive rate, recall, or dataset-wide precision estimate."
         )
     if metrics.empty:
         return empty_message(
@@ -734,8 +738,19 @@ def show_evaluation(a):
                     "seed": meta.get("seed"),
                     "threshold_method": meta.get("threshold_method"),
                     "evaluation_unit": meta.get("evaluation_unit"),
+                    "contextual_features_enabled": meta.get("contextual_features_enabled"),
+                    "contextual_reference_method": meta.get("contextual_reference_method"),
+                    "peer_radius_meters": meta.get("peer_radius_meters"),
+                    "peer_minimum": meta.get("peer_minimum"),
+                    "peer_tolerance": meta.get("peer_tolerance"),
                 }
             )
+    if not a["contextual_coverage"].empty:
+        st.subheader("Physical peer-reference availability")
+        st.caption(
+            "Peer features use official mote coordinates and the configured radius. They are spatial comparison evidence, not confirmed faults; missing context is not scored as normal."
+        )
+        st.dataframe(a["contextual_coverage"], width="stretch", hide_index=True)
     st.caption(
         "Synthetic amplitudes and durations were chosen by the experimenter and do not estimate natural failure prevalence. Scores are not probabilities of failure."
     )
@@ -985,6 +1000,12 @@ def show_health(a):
         unsafe_allow_html=True,
     )
     st.dataframe(summaries, width="stretch", hide_index=True)
+    if not a["voltage_windows"].empty:
+        st.subheader("Temperature-adjusted voltage candidates")
+        st.caption(
+            "Unverified candidate windows only. The dataset documentation reports strong temperature dependence; no battery-failure labels are available."
+        )
+        st.dataframe(a["voltage_windows"], width="stretch", hide_index=True)
     fig = px.line(
         records.sort_values("timestamp"),
         x="timestamp",

@@ -1,8 +1,10 @@
 """Run bounded-memory fault injection, comparisons, plots and voltage cases."""
 
 import argparse
+import hashlib
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -12,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from sensorguard.experiment import evaluate_track
-from sensorguard.historical import voltage_case_studies
+from sensorguard.historical import voltage_case_studies, voltage_window_candidates
 from sensorguard.ingestion import iter_records
 
 
@@ -120,9 +122,28 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--threshold-quantile", type=float, default=0.99)
+    parser.add_argument(
+        "--contextual",
+        action="store_true",
+        help="add causal, training-baseline-adjusted statistical peer features",
+    )
+    parser.add_argument(
+        "--peer-map",
+        help="optional JSON mapping target sensor IDs to allowed peer sensor IDs",
+    )
+    parser.add_argument("--peer-radius-meters", type=float, default=8.0)
+    parser.add_argument("--peer-minimum", type=int, default=3)
+    parser.add_argument("--peer-tolerance", default="120s")
     args = parser.parse_args()
     out = Path(args.output_dir)
+    if out.exists() and any(out.iterdir()):
+        raise SystemExit(f"Output directory already contains files: {out}; choose a new path.")
     out.mkdir(parents=True, exist_ok=True)
+    started = time.perf_counter()
+    digest = hashlib.sha256()
+    with Path(args.input).open("rb") as source:
+        for block in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(block)
     sensors = {int(x.strip()) for x in args.sensors.split(",") if x.strip()}
     frame, counts = load_reservoir(args.input, sensors, args.max_per_sensor, args.seed)
     if frame.empty:
@@ -138,17 +159,34 @@ def main():
     frame = frame[pd.to_datetime(frame.timestamp).between(lo, hi)].copy()
     excluded_outside_dense_window = before_filter - len(frame)
     frame = frame.sort_values(["timestamp", "sensor_id"], kind="stable").reset_index(drop=True)
+    peer_map = None
+    if args.peer_map:
+        peer_map_payload = json.loads(Path(args.peer_map).read_text(encoding="utf-8"))
+        peer_map = {
+            int(sensor): tuple(int(peer) for peer in peers)
+            for sensor, peers in peer_map_payload.items()
+        }
+        if not args.contextual:
+            parser.error("--peer-map requires --contextual")
     result = evaluate_track(
         frame,
         seed=args.seed,
         threshold_quantile=args.threshold_quantile,
         autoencoder_epochs=args.epochs,
         n_estimators=100,
+        use_contextual_features=args.contextual,
+        peer_neighborhoods=peer_map,
+        peer_radius_m=args.peer_radius_meters,
+        peer_tolerance=args.peer_tolerance,
+        minimum_peers=args.peer_minimum,
     )
     alert_breakdown, rule_breakdown, reading_alert_summary = alert_breakdowns(
         result["prediction_details"]
     )
     historical = voltage_case_studies(frame)
+    voltage_windows = voltage_window_candidates(
+        frame.to_dict(orient="records"), window_days=7, minimum_rows=50
+    )
     tables = {
         # Reuse this bounded, unmodified chronological sample with the training
         # CLI. Keeping it beside the evaluation artifacts makes the exact model
@@ -170,6 +208,8 @@ def main():
         "errors": result["error_cases"],
         "detection_delay": result["detection_delay"],
         "historical_voltage_candidates": historical,
+        "historical_voltage_windows": voltage_windows,
+        "contextual_coverage": result["contextual_coverage"],
     }
     curves = []
     for detector, curve in result["pr_curves"].items():
@@ -187,6 +227,34 @@ def main():
         json.dumps(
             {
                 "seed": args.seed,
+                "dataset_sha256": digest.hexdigest(),
+                "contextual_features_enabled": args.contextual,
+                "contextual_feature_columns": result["contextual_features"],
+                "contextual_peer_sensors_used": len(
+                    set(
+                        result["contextual_coverage"].loc[
+                            result["contextual_coverage"].context_available > 0,
+                            "sensor_id",
+                        ]
+                    )
+                    if args.contextual and not result["contextual_coverage"].empty
+                    else set()
+                ),
+                "peer_neighborhoods": {
+                    str(sensor): list(peers)
+                    for sensor, peers in result["peer_neighborhoods"].items()
+                },
+                "contextual_reference_method": (
+                    "user-supplied sensor neighborhood mapping"
+                    if args.peer_map
+                    else f"official physical mote coordinates, Euclidean radius {args.peer_radius_meters:g} m"
+                    if args.contextual
+                    else "disabled"
+                ),
+                "peer_radius_meters": args.peer_radius_meters,
+                "peer_minimum": args.peer_minimum,
+                "peer_tolerance": args.peer_tolerance,
+                "end_to_end_seconds": None,
                 "sample_per_sensor_cap": args.max_per_sensor,
                 "sampling_method": "first N source-order records per selected sensor, then chronological sort; preserves local sampling cadence better than random thinning",
                 "source_rows_seen_per_sensor": counts,
@@ -270,6 +338,11 @@ def main():
         f"Seed: {args.seed}. Streamed up to the first {args.max_per_sensor} source-order records per requested sensor, then retained {len(frame):,} records within one day of the sample median timestamp (excluded {excluded_outside_dense_window} isolated records outside that dense window) and sorted chronologically. This bounded subset better preserves local sampling cadence than random thinning. Source data remains untouched.",
         f"Chronological partitions: {result['split_sizes']}. Training range: {result['training_range']}; validation: {result['validation_range']}; held-out test: {result['test_range']}.",
         "Injected faults are applied only to a copy of the held-out test set. Detector fitting uses unmodified training rows. Isolation Forest, autoencoder, and statistical-rule cutoffs are calibrated using unmodified validation score distributions only; injected labels are not used for fitting or calibration. A validation quantile is an operating-point choice on unlabeled data, not a claim that validation rows are normal.",
+        (
+            "Contextual mode uses backward-aligned peers within the configured physical radius from official coordinates (or the explicit user map), training-only per-sensor/feature medians, the configured maximum age, and the configured minimum peer count. Each reading is excluded from its own reference; same-time peer values are allowed; future peer observations are excluded. This is physical proximity, not proof of shared environment. Peer availability and alignment summaries are exported separately."
+            if args.contextual
+            else "Contextual peer features are disabled for this run. Use --contextual for the causal physical-neighborhood reference ablation."
+        ),
         "Evaluation unit is the sensor-feature-reading pair; timestamp-only edits use a `record` marker. Only directly modified pairs have known positive labels. All other historical pairs remain unlabeled and are not called true negatives. Alert rows are deduplicated per detector and pair. Injected-pair recall and missed injected pairs are measurable, but precision, F1, false-positive rate, true negatives, and PR curves are not reported for this partly labeled test set. Alerts on unlabeled pairs are counted descriptively, not called false positives. Synthetic distributions do not represent natural failure prevalence or failure dynamics.",
         "Historical cases below are exploratory candidates from the observed records, not labeled faults. Voltage is regressed against temperature per sensor before estimating the residual time trend; this linear adjustment is not causal. Dataset documentation: https://db.csail.mit.edu/labdata/labdata.html.",
         "",
@@ -309,9 +382,17 @@ def main():
         "",
         markdown_table(result["fault_manifest"]),
         "",
-        "## Historical voltage candidate summary",
-        "",
     ]
+    if args.contextual:
+        report += [
+            "## Contextual reference availability",
+            "",
+            markdown_table(result["contextual_coverage"]),
+            "",
+            "Contextual scores are only calculated when the target has a training baseline and at least three prior peer sensors within 120 seconds. A missing score means insufficient context; it is not scored as normal.",
+            "",
+        ]
+    report += ["## Historical voltage candidate summary", ""]
     if historical.empty:
         report.append(
             "No sensor had enough complete voltage and temperature records in the sample."
@@ -324,6 +405,13 @@ def main():
         report.append(
             f"In this sample, {declines} sensors met the exploratory temperature-adjusted decline threshold and {abrupt} met the abrupt-step threshold. These flags remain unverified candidate cases."
         )
+    report += ["", "## Temperature-adjusted voltage candidate windows", ""]
+    if voltage_windows.empty:
+        report.append(
+            "No seven-day sensor window met the minimum of 50 complete readings in this bounded sample."
+        )
+    else:
+        report.append(markdown_table(voltage_windows))
     report += [
         "",
         "No historical pattern is called a confirmed battery failure. Temperature, sensor load, environmental conditions, calibration drift, missing intervals, and data truncation are alternative explanations. Independent battery or maintenance ground truth is not available.",
@@ -332,6 +420,10 @@ def main():
         "",
     ]
     (out / "experiment_report.md").write_text("\n".join(report), encoding="utf-8")
+    metadata_path = out / "experiment_metadata.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["end_to_end_seconds"] = time.perf_counter() - started
+    metadata_path.write_text(json.dumps(metadata, indent=2, default=str) + "\n", encoding="utf-8")
     print(
         json.dumps(
             {

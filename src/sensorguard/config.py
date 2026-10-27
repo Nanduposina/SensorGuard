@@ -20,6 +20,7 @@ class SensorGuardConfig:
     chunk_size: int = 100_000
     contextual_tolerance_seconds: float = 120.0
     minimum_peer_sensors: int = 3
+    physical_neighborhood_radius_meters: float = 8.0
     abrupt_change_limits: dict[str, float] = field(
         default_factory=lambda: {
             "temperature": 10.0,

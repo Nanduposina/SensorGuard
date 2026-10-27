@@ -7,6 +7,13 @@ import pandas as pd
 from sklearn.metrics import precision_recall_curve
 
 from .autoencoder import AutoencoderDetector
+from .config import SensorGuardConfig
+from .context import (
+    CONTEXT_FEATURES,
+    add_peer_features,
+    fit_peer_baselines,
+)
+from .coordinates import physical_neighborhoods
 from .detection import merge_alerts, normalize_input
 from .evaluation import chronological_split, partially_labeled_metrics
 from .injection import FaultSpec, inject_faults
@@ -85,6 +92,11 @@ def evaluate_track(
     threshold_quantile=0.99,
     autoencoder_epochs=30,
     n_estimators=100,
+    use_contextual_features=False,
+    peer_neighborhoods=None,
+    peer_radius_m=8.0,
+    peer_tolerance="120s",
+    minimum_peers=3,
 ):
     """Fit on unmodified train, calibrate on unmodified validation, and test injections.
 
@@ -94,6 +106,49 @@ def evaluate_track(
     """
     data = normalize_input(frame).reset_index(drop=True).sort_values("timestamp", kind="stable")
     train, val, test = chronological_split(data, 0.6, 0.2)
+    peer_baselines = {}
+    context_config = None
+    if use_contextual_features:
+        peer_baselines = fit_peer_baselines(train, minimum_rows=20)
+        user_peer_map = peer_neighborhoods is not None
+        if peer_neighborhoods is None:
+            peer_neighborhoods = physical_neighborhoods(radius_m=peer_radius_m)
+        context_config = {
+            "tolerance": peer_tolerance,
+            "minimum_peers": minimum_peers,
+            "radius_m": peer_radius_m,
+            "reference_type": "user_mapping" if user_peer_map else "physical_coordinates",
+        }
+        train = add_peer_features(
+            train,
+            train,
+            baselines=peer_baselines,
+            tolerance=context_config["tolerance"],
+            minimum_peers=context_config["minimum_peers"],
+            neighborhoods=peer_neighborhoods,
+            radius_m=context_config["radius_m"],
+        )
+        raw_train = train.copy()
+        raw_validation = val.copy()
+        val = add_peer_features(
+            val,
+            pd.concat([raw_train, raw_validation]),
+            baselines=peer_baselines,
+            tolerance=context_config["tolerance"],
+            minimum_peers=context_config["minimum_peers"],
+            neighborhoods=peer_neighborhoods,
+            radius_m=context_config["radius_m"],
+        )
+        clean_test = add_peer_features(
+            test,
+            pd.concat([raw_train, raw_validation, test]),
+            baselines=peer_baselines,
+            tolerance=context_config["tolerance"],
+            minimum_peers=context_config["minimum_peers"],
+            neighborhoods=peer_neighborhoods,
+            radius_m=context_config["radius_m"],
+        )
+        test = clean_test
     # Controlled injection deliberately targets held-out test only.
     specs = []
     usable = test.groupby("sensor_id").size()
@@ -117,15 +172,22 @@ def evaluate_track(
     ]
     specs = [s for s in specs if s.duration > 0 and s.start_index + s.duration <= len(group)]
     injected = inject_faults(test, specs, seed=seed)
-    rules = RuleDetector().fit(train, val)
+    rule_config = (
+        SensorGuardConfig(minimum_peer_sensors=minimum_peers) if use_contextual_features else None
+    )
+    rules = RuleDetector(rule_config).fit(train, val)
     iso = IsolationForestDetector(
-        random_state=seed, n_estimators=n_estimators, contamination="auto"
+        random_state=seed,
+        n_estimators=n_estimators,
+        contamination="auto",
+        use_contextual_features=use_contextual_features,
     ).fit(train)
     ae = AutoencoderDetector(
         seed=seed,
         epochs=autoencoder_epochs,
         threshold_quantile=threshold_quantile,
         patience=max(2, min(8, autoencoder_epochs // 3)),
+        use_contextual_features=use_contextual_features,
     ).fit(train, val)
     # Calibrate IF cutoff only on unmodified validation scores, without injection labels.
     val_scores = iso.score_samples(val)[1]
@@ -161,6 +223,10 @@ def evaluate_track(
     clean["combined_rules_if_ae"] = merge_alerts(
         clean["rules"], clean["isolation_forest"], clean["autoencoder"]
     )
+    mode_suffix = "_contextual" if use_contextual_features else ""
+    if mode_suffix:
+        predictions = {f"{name}{mode_suffix}": output for name, output in predictions.items()}
+        clean = {f"{name}{mode_suffix}": output for name, output in clean.items()}
     # Evaluate each feature-reading pair with stable modified timestamps.
     truth = {
         (r.timestamp, r.sensor_id, r.feature) for r in injected.labels.itertuples() if r.is_fault
@@ -378,12 +444,54 @@ def evaluate_track(
             "rule_sensor_deviation_validation_quantile": rules.config.sensor_deviation_validation_quantile,
             "rule_sensor_deviation_thresholds": rules.sensor_deviation_thresholds,
             "rule_baseline_scale_floors": rules.baseline_scale_floors,
+            "contextual_enabled": bool(use_contextual_features),
+            "contextual_thresholds": rules.contextual_thresholds,
+            "peer_reference": context_config,
         },
+        "contextual_features": list(CONTEXT_FEATURES) if use_contextual_features else [],
+        "peer_baselines": peer_baselines,
+        "peer_neighborhoods": peer_neighborhoods or {},
+        "contextual_coverage": _contextual_coverage(test)
+        if use_contextual_features
+        else pd.DataFrame(),
         "split_sizes": {"train": len(train), "validation": len(val), "test": len(test)},
         "training_range": [str(train.timestamp.min()), str(train.timestamp.max())],
         "validation_range": [str(val.timestamp.min()), str(val.timestamp.max())],
         "test_range": [str(test.timestamp.min()), str(test.timestamp.max())],
     }
+
+
+def _contextual_coverage(frame: pd.DataFrame) -> pd.DataFrame:
+    """Summarize peer availability on scored test rows, not just injected rows."""
+    rows = []
+    for sensor_id, group in frame.groupby("sensor_id", dropna=True):
+        for feature in FEATURES:
+            z_column = f"{feature}_peer_robust_z"
+            count_column = f"{feature}_peer_count"
+            if z_column not in group or count_column not in group:
+                continue
+            raw_observed = (
+                group[feature].notna() if feature in group else pd.Series(False, index=group.index)
+            )
+            available = pd.to_numeric(group[z_column], errors="coerce").notna()
+            peer_counts = pd.to_numeric(group[count_column], errors="coerce")
+            rows.append(
+                {
+                    "sensor_id": sensor_id,
+                    "feature": feature,
+                    "scored_observations": int(raw_observed.sum()),
+                    "context_available": int((raw_observed & available).sum()),
+                    "availability_rate": float(
+                        (raw_observed & available).sum() / raw_observed.sum()
+                    )
+                    if raw_observed.any()
+                    else None,
+                    "mean_prior_peer_sensors": float(peer_counts[raw_observed].mean())
+                    if raw_observed.any()
+                    else None,
+                }
+            )
+    return pd.DataFrame(rows)
 
 
 def _detection_delays(pred, manifest):

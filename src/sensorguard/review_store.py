@@ -137,6 +137,7 @@ def reviewed_alert_summary(alerts: pd.DataFrame, reviews: list[dict[str, Any]]) 
     matched = [review for review in reviews if review["alert_id"] in current_ids]
     counts = {label: sum(review["label"] == label for review in matched) for label in LABELS}
     binary = counts["confirmed_anomaly"] + counts["normal_behavior"]
+    matched_normal_share = counts["normal_behavior"] / binary if binary else None
     return {
         "current_alerts": len(current),
         "matched_reviews": len(matched),
@@ -144,6 +145,8 @@ def reviewed_alert_summary(alerts: pd.DataFrame, reviews: list[dict[str, Any]]) 
         "normal_behavior": counts["normal_behavior"],
         "uncertain": counts["uncertain"],
         "binary_reviewed": binary,
+        "reviewed_alert_normal_share": matched_normal_share,
+        "reviewed_alert_unit": "matched predicted alert; selection is conditional on an alert",
         "reviewed_alert_confirmation_rate": (
             counts["confirmed_anomaly"] / binary if binary else None
         ),

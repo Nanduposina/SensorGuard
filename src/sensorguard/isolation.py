@@ -9,6 +9,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler
 
+from .context import CONTEXT_FEATURES
 from .detection import RESULT_COLUMNS, empty_results, normalize_input
 
 FEATURES = ("temperature", "humidity", "light", "voltage")
@@ -25,12 +26,14 @@ class IsolationForestDetector:
         random_state=42,
         threshold: float | None = None,
         minimum_baseline_rows: int = 20,
+        use_contextual_features: bool = False,
     ):
         self.contamination = contamination
         self.n_estimators = n_estimators
         self.random_state = random_state
         self.threshold = threshold
         self.minimum_baseline_rows = minimum_baseline_rows
+        self.use_contextual_features = use_contextual_features
         self.model = None
         self.imputer = None
         self.scaler = None
@@ -47,6 +50,12 @@ class IsolationForestDetector:
         numeric = (
             data[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
         )
+        if self.use_contextual_features:
+            context_cols = [f for f in CONTEXT_FEATURES if f in data]
+            if not context_cols:
+                raise ValueError("contextual features were enabled but not supplied to the frame")
+            contextual = data[context_cols].apply(pd.to_numeric, errors="coerce")
+            numeric = pd.concat([numeric, contextual], axis=1)
         if "light" in numeric:
             numeric["light"] = np.log1p(numeric["light"].clip(lower=0))
         if fitting:

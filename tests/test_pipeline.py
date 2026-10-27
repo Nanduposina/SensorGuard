@@ -74,7 +74,8 @@ def test_duplicates_and_sampling_gap():
         for i, sid in [(0, 1), (0, 1), (9, 1)]
     ]
     checked = validate_frame(pd.DataFrame(records), SensorGuardConfig(sampling_gap_seconds=5))
-    assert checked.duplicate.iloc[:2].all()
+    assert not checked.duplicate.iloc[0]
+    assert checked.duplicate.iloc[1]
     assert "sampling_gap" in checked.iloc[2].issues
 
 
