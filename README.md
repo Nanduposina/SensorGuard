@@ -12,7 +12,7 @@ CI runs on pushes and pull requests through [GitHub Actions](./.github/workflows
 - Uses chronological train/validation/test partitions; fits preprocessing on training rows and calibrates model thresholds on unmodified validation data (not independently verified fault-free).
 - Injects seeded synthetic faults into a separate held-out copy and records the changed readings and ground truth.
 - Reports feature-reading pair metrics against synthetic labels, no-injection test alert rates, fault-type results and exploratory voltage cases.
-- Serves cached data and precomputed results in a five-section Streamlit dashboard; the UI does not train models.
+- Serves cached data and precomputed results in a six-section Streamlit dashboard; the UI does not train models.
 
 ## Architecture
 
@@ -32,11 +32,13 @@ flowchart LR
   Inject --> Metrics[Evaluation tables and plots]
   Merge --> Dashboard[Streamlit dashboard]
   Metrics --> Dashboard
+  Dashboard --> Review[Local SQLite review store]
+  Review --> Backup[Validated JSON backup / restore]
 ```
 
 ## Requirements and setup
 
-Python 3.10 or newer is required. Install the package and development/dashboard tools from the repository root:
+Python 3.10 or newer and Git are required. The clean demo below was verified with Python 3.12.10 on Windows; CI runs Python 3.11 on Linux. PowerShell is used for the documented Windows commands. Install the package and development/dashboard tools from the repository root:
 
 ```powershell
 python -m venv .venv
@@ -47,6 +49,8 @@ python -m pytest -q
 ```
 
 Linux/macOS activation is `source .venv/bin/activate`. CPU inference and training are supported; CUDA is optional. CI uses Python 3.11 and synthetic data only.
+
+The editable installation installs the dependencies declared in `pyproject.toml`, including PyTorch and Streamlit. PyTorch is a large download; allow several hundred megabytes for the environment. The demo writes bounded output under `artifacts/phase4-demo/` and a local SQLite review store under `.sensorguard/`; both are ignored by Git. On the verification machine repeated full profiles took 24.9–58.0 seconds with a 330 MiB peak working set; the four-sensor experiment took 49.1 seconds. Timings depend on hardware and disk speed.
 
 ## Data provenance and placement
 
@@ -101,9 +105,9 @@ The runner scans the source, retains at most the first N source-order rows per r
 
 The experiment directory contains `sampled_records.csv`, split/test records, injected observations and manifest, per-pair prediction details, detector metrics, no-injection alert baseline, per-fault and per-sensor tables, detector/feature/rule and distinct-reading alert breakdowns, threshold metadata, voltage candidates, plots, and `experiment_report.md`. Unmodified observations have no verified labels, so their alerts are descriptive rather than false-positive counts.
 
-### Latest measured bounded experiment and diagnosis
+### Larger all-sensor bounded experiment and diagnosis
 
-The full one-pass profile processed 2,313,682 rows in 78.47 seconds with a measured peak working set of 329.6 MiB on this Windows environment. The bounded evaluation scanned the source and selected up to 250 source-order records for each of the 61 observed IDs, then retained 12,977 rows in its dense time window (1,064 outside-window rows excluded). The chronological split was 7,786 train, 2,595 validation, and 2,596 test rows. It injected 3 events affecting 11 feature-reading pairs, evaluated 12,980 pairs, and completed the detector experiment in about 44 seconds; training/export on the saved sample took about 18 seconds. The saved evaluation threshold quantile was 0.99.
+The most recent full one-pass profile processed 2,313,682 rows in 24.90 seconds with a measured peak working set of 330.0 MiB on this Windows environment. The larger all-sensor bounded evaluation scanned the source and selected up to 250 source-order records for each of the 61 observed IDs, then retained 12,977 rows in its dense time window (1,064 outside-window rows excluded). The chronological split was 7,786 train, 2,595 validation, and 2,596 test rows. It injected 3 events affecting 11 feature-reading pairs, evaluated 12,980 pairs, and completed the detector experiment in about 44 seconds; training/export on the saved sample took about 18 seconds. The saved evaluation threshold quantile was 0.99.
 
 These figures supersede the earlier confusion table, which treated every unmodified reading as a verified negative. That assumption was not supported by the unlabeled source, so the old precision and apparent-FPR values are withdrawn as accuracy claims. The current run has 12,980 sensor-feature-reading pairs, 11 directly modified positives, and 12,969 unlabeled pairs. No real-world precision, F1 or false-positive rate can be established from this sample.
 
@@ -124,7 +128,9 @@ In the recalibrated run, the quality-rule ablation generated 172 pairs versus 2,
 
 Historical voltage patterns remain candidates only. Voltage is strongly related to temperature in the dataset; analysis adjusts for a per-sensor linear temperature relationship but cannot make a causal attribution. No independent battery-failure labels are available. The detector is an exploratory research pipeline, not an unattended or production-validated alarm system.
 
-A smaller four-sensor smoke run (100 rows per ID, seed 42, two epochs) completed in about 30 seconds and produced 386 sample rows, 78 test rows, and the same 3 injected events. Generated artifacts are local under `artifacts/` and excluded from Git. These runs exercise the full detector workflow on a bounded sample, not model training over every raw record.
+A smaller four-sensor smoke run (100 rows per ID, seed 42, two epochs) took 49.1 seconds and produced 386 sample rows, 78 test rows, and 3 injected events. Generated artifacts are local under `artifacts/` and excluded from Git. These runs exercise the full detector workflow on a bounded sample, not model training over every raw record.
+
+The latest clean-install demo rerun used Python 3.12.10 and the four-sensor configuration above. It retained 386 rows (14 outside the dense time window excluded), split into 231 train / 77 validation / 78 test records, and injected three events that modified 11 feature-reading pairs. There were 390 evaluated test pairs: 11 known injected positives and 379 unlabeled pairs. The combined rules + Isolation Forest + autoencoder detector found all 11 injected pairs (recall 1.0) and flagged 185 of the 379 unlabeled pairs (48.8% descriptive alert rate). Rules alone also found 11/11 and flagged 80 unlabeled pairs (21.1%); Isolation Forest found 6/11 and flagged 98 (25.9%); the autoencoder found 6/11 and flagged 93 (24.5%). These are small synthetic-injection results. The 379 observations are not verified negatives, so precision, F1 and false-positive rate cannot be calculated. Threshold quantile was 0.99, fitted/calibrated without test labels; full measured details and exact splits are in the generated `experiment_metadata.json` and `metrics.csv`.
 
 ## Dashboard
 
@@ -136,27 +142,30 @@ $env:SENSORGUARD_MODEL_DIR = "artifacts/all_sensors_250/models"
 streamlit run app.py
 ```
 
-Overview displays available profile and experiment outputs; Sensor explorer plots bounded sensor readings and peer references; Alert investigation filters and exports precomputed findings; Alert review collects independent labels; Model evaluation separates synthetic metrics from unlabeled case studies; Sensor health summarizes completeness, gaps, alerts and candidate voltage signals. Missing artifacts or data produce empty states. Set `SENSORGUARD_DATA_PATH`, `SENSORGUARD_EXPERIMENT_DIR`, `SENSORGUARD_PROFILE_PATH`, `SENSORGUARD_MODEL_DIR` and `SENSORGUARD_REVIEW_STORE` to configure paths. The data has no timezone metadata and the dashboard presents timestamps as recorded.
+Overview displays available profile and experiment outputs; Sensor explorer plots bounded sensor readings and peer references; Alert investigation filters and exports precomputed findings; Alert review collects independent labels; Model evaluation separates synthetic metrics from unlabeled case studies and matched human reviews; Sensor health summarizes completeness, gaps, alerts and candidate voltage signals. Missing artifacts or data produce actionable empty states. Set `SENSORGUARD_DATA_PATH`, `SENSORGUARD_EXPERIMENT_DIR`, `SENSORGUARD_PROFILE_PATH`, `SENSORGUARD_MODEL_DIR` and `SENSORGUARD_REVIEW_STORE` to configure paths. The data has no timezone metadata and the dashboard presents timestamps as recorded.
 
-### Human alert review demo
+## Fresh-clone end-to-end demo (Windows PowerShell)
 
-Generate a small experiment artifact set and start the dashboard:
+Download the Intel Berkeley dataset from the official [dataset page](https://db.csail.mit.edu/labdata/labdata.html) and place the original text file at `data.txt/data.txt` (or supply another path). SensorGuard does not download or redistribute the dataset. From a fresh clone, these commands install into a new environment, profile the source, run a deterministic bounded experiment, and launch the dashboard:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\run_experiment.py `
-  --input "data.txt/data.txt" `
-  --output-dir artifacts\phase3-demo `
-  --sensors 1,2,3,4 `
-  --max-per-sensor 100 `
-  --seed 42 `
-  --epochs 2
-$env:SENSORGUARD_DATA_PATH = "data.txt/data.txt"
-$env:SENSORGUARD_EXPERIMENT_DIR = "artifacts/phase3-demo"
-$env:SENSORGUARD_REVIEW_STORE = ".sensorguard/reviews.sqlite3"
-streamlit run app.py
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev,dashboard]"
+python -m pip check
+./scripts/demo.ps1
 ```
 
-Open **Alert review**, filter the unmodified historical alert list, select an alert, inspect its sensor, recorded timestamp, feature value, detector, score/severity and explanation, then choose **Confirmed anomaly**, **Normal behavior**, or **Uncertain / needs investigation**. Add optional evidence notes and press **Save review decision**. A saved decision can be revisited and updated. The page excludes predictions from the synthetic-injection copy so generated test faults cannot be mistaken for historical findings. The Model evaluation page separately reports the class balance and confirmation rate among matched, binary-reviewed alerts; this selected-alert rate is descriptive, not recall or dataset-wide precision.
+The demo script accepts `-InputPath`, `-Python`, and `-Port`; for example, `./scripts/demo.ps1 -InputPath "D:\datasets\data.txt.gz" -Python .\.venv\Scripts\python.exe -Port 8502`. It refuses to proceed when the input is missing, profiles it to `artifacts/phase4-demo/data_profile.md`, and runs the experiment on sensors 1–4 with a 100-row per-sensor cap, seed 42 and two autoencoder epochs. Outputs are local under `artifacts/phase4-demo/experiment/`. No prior `phase2_improved` or `phase3-demo` artifacts are required.
+
+When the dashboard opens at `http://localhost:8501`, use **Alert investigation** to filter unmodified alerts, then open **Alert review**. This bounded run contains multiple reviewable unmodified alerts: select different alerts and save one as **Confirmed anomaly**, one as **Normal behavior**, and one as **Uncertain / needs investigation**; add notes if useful. Revisit a saved alert by selecting it and update its decision. Use **Download review backup (JSON)** to save a backup outside the repository. To test restore, choose the backup file under **Import a SensorGuard review JSON**, click **Import review file**, and explicitly enable overwrite only if replacing matching IDs is intended. The page reports imported and replaced counts; malformed files and unconfirmed conflicts are rejected without partial writes. **Model evaluation** shows synthetic injected labels separately from the unmodified and human-reviewed historical alerts. Do not use injected test-copy alerts as historical review labels.
+
+The script serves all six sections using the generated artifacts: Overview, Sensor explorer, Alert investigation, Alert review, Model evaluation and Sensor health. To rerun only a stage, use the profiler and experiment commands under the corresponding sections above and point `SENSORGUARD_EXPERIMENT_DIR` and `SENSORGUARD_PROFILE_PATH` to the outputs. The output directory may be deleted and regenerated; the raw dataset is never modified.
+
+### Alert-review storage and interpretation
+
+Open **Alert review**, filter the unmodified historical alert list, select an alert, inspect its sensor, recorded timestamp, feature value, detector, score/severity and explanation, then choose a review label. Add optional evidence notes and press **Save review decision**. A saved decision can be revisited and updated. The page excludes predictions from the synthetic-injection copy so generated test faults cannot be mistaken for historical findings. The Model evaluation page separately reports the class balance and confirmation rate among matched, binary-reviewed alerts; this selected-alert rate is descriptive, not recall or dataset-wide precision.
 
 By default, feedback is stored in `.sensorguard/reviews.sqlite3`, separate from raw readings, prediction files and model artifacts. Set `SENSORGUARD_REVIEW_STORE` to use another local path. The `.sensorguard/` directory is ignored by Git. Use **Download review backup (JSON)** to export a versioned portable backup. Import validates the schema, labels, identities, timestamps and duplicate IDs before writing. If imported IDs already exist, import stops without writing anything unless the reviewer explicitly checks the overwrite confirmation. Store updates and imports use SQLite transactions.
 

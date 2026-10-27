@@ -213,6 +213,21 @@ def test_alert_review_streamlit_saves_and_updates_decision(tmp_path, monkeypatch
     assert len(stored) == 1
     assert stored[0]["label"] == "normal_behavior"
 
+    app.radio(key="review_decision").set_value("uncertain").run()
+    app.button(key="save_review").click().run()
+    assert not app.exception
+    stored = ReviewStore(review_path).list_reviews()
+    assert len(stored) == 1
+    assert stored[0]["label"] == "uncertain"
+
+    from sensorguard.review_store import export_reviews
+
+    backup = export_reviews(stored)
+    restored_path = tmp_path / "restored" / "reviews.sqlite3"
+    restored = ReviewStore(restored_path)
+    assert restored.import_reviews(backup) == {"imported": 1, "overwritten": 0}
+    assert restored.list_reviews()[0]["label"] == "uncertain"
+
 
 def test_model_evaluation_shows_matched_human_review_summary(tmp_path, monkeypatch):
     from streamlit.testing.v1 import AppTest
