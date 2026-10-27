@@ -29,16 +29,22 @@ def validate_frame(frame: pd.DataFrame, config: SensorGuardConfig | None = None)
     if "issues" not in result:
         result["issues"] = [[] for _ in range(len(result))]
     result["issues"] = result["issues"].map(lambda v: list(v) if isinstance(v, list) else [])
-    for idx, row in result.iterrows():
-        issues = row["issues"]
-        mote = row.get("moteid")
+    feature_values = {
+        feature: result[feature].to_numpy() if feature in result else None
+        for feature in cfg.physical_limits
+    }
+    issue_values = result["issues"].tolist()
+    mote_values = result["moteid"].to_numpy()
+    for idx, mote in enumerate(mote_values):
+        issues = issue_values[idx]
         if pd.notna(mote) and int(mote) not in cfg.sensor_ids:
             issues.append("invalid_sensor_id")
         for feature, (low, high) in cfg.physical_limits.items():
-            value = row.get(feature)
+            values = feature_values[feature]
+            value = values[idx] if values is not None else None
             if pd.notna(value) and not low <= float(value) <= high:
                 issues.append(f"suspicious_{feature}")
-    result["issues"] = result["issues"].map(lambda x: list(dict.fromkeys(x)))
+    result["issues"] = [list(dict.fromkeys(x)) for x in issue_values]
     result["duplicate"] = False
     keyed = result.dropna(subset=["timestamp", "moteid"])
     result.loc[keyed.index, "duplicate"] = keyed.duplicated(
@@ -190,7 +196,22 @@ def clean_frame(
             return "missing_sensor_id"
         return "malformed_record"
 
-    for index, row in result.iterrows():
+    columns = list(result.columns)
+    retained_values: list[bool] = []
+    duplicate_values: list[bool] = []
+    out_of_order_values: list[bool] = []
+    issue_text_values: list[str] = []
+    action_text_values: list[str] = []
+    provenance_values: list[str] = []
+    issue_output_values: list[list[str]] = []
+    measurement_output = {
+        feature: result[feature].to_numpy(copy=True)
+        for feature in MEASUREMENTS
+        if feature in result
+    }
+    for row_tuple in result.itertuples(index=True, name=None):
+        index = row_tuple[0]
+        row = dict(zip(columns, row_tuple[1:], strict=True))
         issues = list(row.get("issues", [])) if isinstance(row.get("issues"), (list, tuple)) else []
         if pd.isna(row.get("timestamp")):
             original_timestamp = row.get("original_timestamp")
@@ -206,7 +227,7 @@ def clean_frame(
             issues.append("duplicate_record")
         if bool(row["_duplicate_key"]):
             issues.append("duplicate_key")
-        if pd.notna(row.get("moteid")) and int(row.moteid) not in cfg.sensor_ids:
+        if pd.notna(row.get("moteid")) and int(row.get("moteid")) not in cfg.sensor_ids:
             issues.append("unexpected_sensor_id")
         for feature in MEASUREMENTS:
             value = row.get(feature)
@@ -223,10 +244,8 @@ def clean_frame(
             issues.append("sampling_gap")
 
         issues = sorted(set(str(item) for item in issues))
-        result.at[index, "duplicate"] = "duplicate_key" in issues
-        result.at[index, "out_of_order"] = (
-            bool(row.get("out_of_order", False)) or "out_of_order" in issues
-        )
+        duplicate_values.append("duplicate_key" in issues)
+        out_of_order_values.append(bool(row.get("out_of_order", False)) or "out_of_order" in issues)
         actions: list[dict[str, object]] = []
         flagged: list[str] = []
         should_drop = False
@@ -253,7 +272,7 @@ def clean_frame(
                         replacement = stats.get(None)
                     if replacement is None or not np.isfinite(float(replacement)):
                         raise ValueError(f"no training median available to impute {feature}")
-                    result.at[index, feature] = float(replacement)
+                    measurement_output[feature][index] = float(replacement)
                     detail["result"] = float(replacement)
                 else:
                     detail["result"] = None
@@ -269,25 +288,39 @@ def clean_frame(
 
         # A drop policy always excludes the entire row from the clean view, but
         # the audit/provenance view below retains it and explains every action.
-        result.at[index, "retained"] = not should_drop
-        result.at[index, "quality_issues"] = ";".join(issues)
-        result.at[index, "policy_actions"] = ";".join(
-            dict.fromkeys(str(item["policy"]) for item in actions)
-        )
-        result.at[index, "cleaning_provenance"] = json.dumps(
-            {
-                "line_number": row.get("line_number"),
-                "sensor_id": None if pd.isna(sensor_id) else int(sensor_id),
-                "timestamp": None if pd.isna(row.get("timestamp")) else str(row.get("timestamp")),
-                "issues": issues,
-                "actions": actions,
-                "retained": not should_drop,
-            },
-            sort_keys=True,
-            default=str,
+        retained_values.append(not should_drop)
+        issue_text_values.append(";".join(issues))
+        action_text_values.append(";".join(dict.fromkeys(str(item["policy"]) for item in actions)))
+        provenance_values.append(
+            json.dumps(
+                {
+                    "line_number": row.get("line_number"),
+                    "sensor_id": None if pd.isna(sensor_id) else int(sensor_id),
+                    "timestamp": None
+                    if pd.isna(row.get("timestamp"))
+                    else str(row.get("timestamp")),
+                    "issues": issues,
+                    "actions": actions,
+                    "retained": not should_drop,
+                },
+                sort_keys=True,
+                default=str,
+            )
         )
         if flagged:
-            result.at[index, "issues"] = list(dict.fromkeys([*issues, *flagged]))
+            issue_output_values.append(list(dict.fromkeys([*issues, *flagged])))
+        else:
+            issue_output_values.append(list(row.get("issues", [])))
+
+    result["duplicate"] = duplicate_values
+    result["out_of_order"] = out_of_order_values
+    result["retained"] = retained_values
+    result["quality_issues"] = issue_text_values
+    result["policy_actions"] = action_text_values
+    result["cleaning_provenance"] = provenance_values
+    result["issues"] = issue_output_values
+    for feature, values in measurement_output.items():
+        result[feature] = values
 
     return result.drop(columns=["_exact_duplicate", "_duplicate_key"])
 

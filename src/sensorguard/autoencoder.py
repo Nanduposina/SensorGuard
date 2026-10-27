@@ -28,6 +28,7 @@ class AutoencoderDetector:
         patience=10,
         device="cpu",
         use_contextual_features=False,
+        measurement_features=None,
     ):
         self.hidden_dims = tuple(hidden_dims)
         self.epochs = epochs
@@ -39,6 +40,7 @@ class AutoencoderDetector:
         self.patience = patience
         self.device = device
         self.use_contextual_features = use_contextual_features
+        self.configured_measurement_features = tuple(measurement_features or FEATURES)
         self.features = []
         self.measurement_features = []
         self.medians = None
@@ -61,7 +63,11 @@ class AutoencoderDetector:
     def _matrix(self, frame, fit=False):
         data = normalize_input(frame).reset_index(drop=True)
         if fit:
-            self.measurement_features = [f for f in FEATURES if f in data]
+            self.measurement_features = [
+                f for f in self.configured_measurement_features if f in data
+            ]
+            if not self.measurement_features:
+                raise ValueError("none of the configured measurement features are present")
             self.features = list(self.measurement_features)
             if self.use_contextual_features:
                 context_features = [f for f in CONTEXT_FEATURES if f in data]
@@ -180,6 +186,14 @@ class AutoencoderDetector:
         errors = (recon - x) ** 2
         return errors.mean(axis=1), errors
 
+    def score_samples(self, frame):
+        """Return per-row aggregate reconstruction errors in input row order."""
+        if self.model is None:
+            raise RuntimeError("detector must be fitted")
+        data, x = self._matrix(frame)
+        aggregate, _ = self._errors_from_x(x)
+        return data, aggregate
+
     def predict(self, frame, threshold=None):
         if self.model is None:
             raise RuntimeError("detector must be fitted")
@@ -228,6 +242,7 @@ class AutoencoderDetector:
                     "patience": self.patience,
                     "device": self.device,
                     "use_contextual_features": self.use_contextual_features,
+                    "measurement_features": self.configured_measurement_features,
                 },
             },
             path,
@@ -241,6 +256,9 @@ class AutoencoderDetector:
         obj.features = payload["features"]
         obj.measurement_features = payload.get(
             "measurement_features", [name for name in obj.features if name in FEATURES]
+        )
+        obj.configured_measurement_features = tuple(
+            payload.get("params", {}).get("measurement_features", obj.measurement_features)
         )
         obj.medians = payload["medians"]
         obj.means = payload["means"]

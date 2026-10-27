@@ -6,7 +6,7 @@ from sensorguard.autoencoder import AutoencoderDetector
 from sensorguard.cli import calibrate_isolation_threshold
 from sensorguard.detection import RESULT_COLUMNS, merge_alerts
 from sensorguard.evaluation import binary_metrics, chronological_split, partially_labeled_metrics
-from sensorguard.isolation import IsolationForestDetector
+from sensorguard.isolation import FEATURES, IsolationForestDetector
 from sensorguard.rules import RuleDetector, contextual_deviations
 
 
@@ -42,6 +42,9 @@ def test_isolation_schema_missing_reproducibility_and_save(tmp_path):
     loaded = IsolationForestDetector.load(path)
     assert np.allclose(a.score_samples(df)[1], loaded.score_samples(df)[1])
     assert pred.is_anomaly.sum() > 0
+    expected_rows = sum(pd.to_numeric(df[name], errors="coerce").notna().sum() for name in FEATURES)
+    assert len(pred) == expected_rows
+    assert pred.groupby(["timestamp", "sensor_id"]).feature.nunique().max() == len(FEATURES)
 
 
 def test_rules_and_context_causal_overlap():

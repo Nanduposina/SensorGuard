@@ -24,6 +24,12 @@ def configured_paths() -> dict[str, Path]:
         "experiment": Path(
             os.getenv("SENSORGUARD_EXPERIMENT_DIR", root / "artifacts" / "experiment")
         ),
+        "real_battery_evaluation": Path(
+            os.getenv(
+                "SENSORGUARD_REAL_BATTERY_EVAL_DIR",
+                root / "artifacts" / "real_battery_evaluation",
+            )
+        ),
         "profile": Path(
             os.getenv("SENSORGUARD_PROFILE_PATH", root / "artifacts" / "data_profile.md")
         ),

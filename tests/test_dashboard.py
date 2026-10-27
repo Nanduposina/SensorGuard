@@ -272,3 +272,51 @@ def test_model_evaluation_shows_matched_human_review_summary(tmp_path, monkeypat
     app.radio(key="workspace_navigation").set_value("Model evaluation").run()
     assert not app.exception
     assert any(metric.label == "Confirmed anomaly" and metric.value == "1" for metric in app.metric)
+
+
+def test_model_evaluation_shows_separate_published_battery_benchmark(tmp_path, monkeypatch):
+    from streamlit.testing.v1 import AppTest
+
+    experiment_dir = tmp_path / "experiment"
+    experiment_dir.mkdir()
+    pd.DataFrame(
+        {
+            "detector": ["rules"],
+            "recall": [1.0],
+            "positive_pairs": [3],
+            "alerts_on_unlabeled_pairs": [2],
+            "unlabeled_alert_rate": [0.1],
+        }
+    ).to_csv(experiment_dir / "metrics.csv", index=False)
+    battery_dir = tmp_path / "battery-evaluation"
+    battery_dir.mkdir()
+    pd.DataFrame(
+        {
+            "detector": ["isolation_forest"],
+            "evaluation_unit": ["held-out vehicle"],
+            "test_fault_vehicles": [2],
+            "test_labeled_normal_vehicles": [5],
+            "false_positives": [1],
+            "false_positive_rate": [0.2],
+        }
+    ).to_csv(battery_dir / "real_battery_metrics.csv", index=False)
+    pd.DataFrame(
+        {
+            "sensor_id": [404],
+            "vehicle_label": [1],
+            "score": [1.2],
+            "label_kind": ["paper_labeled_battery_fault"],
+        }
+    ).to_csv(battery_dir / "real_battery_per_vehicle.csv", index=False)
+    monkeypatch.setenv("SENSORGUARD_EXPERIMENT_DIR", str(experiment_dir))
+    monkeypatch.setenv("SENSORGUARD_REAL_BATTERY_EVAL_DIR", str(battery_dir))
+    monkeypatch.setenv("SENSORGUARD_DATA_PATH", str(tmp_path / "missing.txt"))
+    monkeypatch.setenv("SENSORGUARD_PROFILE_PATH", str(tmp_path / "missing-profile.md"))
+    monkeypatch.setenv("SENSORGUARD_MODEL_DIR", str(tmp_path / "missing-models"))
+    monkeypatch.setenv("SENSORGUARD_REVIEW_STORE", str(tmp_path / "reviews.sqlite3"))
+
+    app = AppTest.from_file(Path(__file__).resolve().parents[1] / "app.py").run()
+    app.radio(key="workspace_navigation").set_value("Model evaluation").run()
+    assert not app.exception
+    assert any("No real battery evaluation artifact" not in item.value for item in app.info)
+    assert len(app.dataframe) >= 2

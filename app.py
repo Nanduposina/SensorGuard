@@ -94,6 +94,7 @@ def cached_json(path: str, version: tuple[int | None, int | None]):
 
 def load_artifacts():
     exp = PATHS["experiment"]
+    battery_eval = PATHS["real_battery_evaluation"]
 
     def csv(name: str) -> pd.DataFrame:
         path = exp / name
@@ -118,6 +119,18 @@ def load_artifacts():
         "metadata": cached_json(
             str(exp / "experiment_metadata.json"),
             cache_version(exp / "experiment_metadata.json"),
+        ),
+        "real_battery_metrics": cached_csv(
+            str(battery_eval / "real_battery_metrics.csv"),
+            cache_version(battery_eval / "real_battery_metrics.csv"),
+        ),
+        "real_battery_vehicles": cached_csv(
+            str(battery_eval / "real_battery_per_vehicle.csv"),
+            cache_version(battery_eval / "real_battery_per_vehicle.csv"),
+        ),
+        "real_battery_metadata": cached_json(
+            str(battery_eval / "real_battery_metadata.json"),
+            cache_version(battery_eval / "real_battery_metadata.json"),
         ),
     }
 
@@ -613,6 +626,20 @@ def show_evaluation(a):
         st.caption(
             f"Binary reviewed sample: {feedback['binary_reviewed']} matched alerts; normal-labelled share: {normal_share_text}. Current alerts: {feedback['current_alerts']}; stored reviews unmatched to this artifact: {feedback['unmatched_stored_reviews']}. Reviewable observations are selected predicted alerts, so this share is not a false-positive rate, recall, or dataset-wide precision estimate."
         )
+    st.subheader("Published real-world battery cases")
+    real_metrics = a.get("real_battery_metrics", pd.DataFrame())
+    if real_metrics.empty:
+        st.info(
+            "No real battery evaluation artifact is configured. The Intel Lab source has no event-level battery ground truth. To show the optional published EV vehicle-level study, set SENSORGUARD_REAL_BATTERY_EVAL_DIR to a completed scripts/evaluate_real_battery.py output directory."
+        )
+    else:
+        st.caption(
+            "Separate benchmark: source-published vehicle-level Li-ion battery fault labels, not Intel Lab event labels. The source reports faults based on driver reports and engineer confirmation. Evaluation is at held-out vehicle level; failure timestamps are not supplied. False-positive metrics use only vehicles labelled normal by that study."
+        )
+        st.dataframe(real_metrics, width="stretch", hide_index=True)
+        vehicle_results = a.get("real_battery_vehicles", pd.DataFrame())
+        if not vehicle_results.empty:
+            st.dataframe(vehicle_results, width="stretch", hide_index=True)
     if metrics.empty:
         return empty_message(
             "Evaluation unavailable",

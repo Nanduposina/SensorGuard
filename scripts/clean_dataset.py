@@ -68,6 +68,10 @@ def run_cleaning(
         state = sqlite3.connect(Path(temporary) / "seen.sqlite3")
         state.execute("CREATE TABLE seen_keys (sensor INTEGER, ts TEXT, PRIMARY KEY(sensor, ts))")
         state.execute("CREATE TABLE seen_raw (digest TEXT PRIMARY KEY)")
+        state.execute(
+            "CREATE TEMP TABLE batch_records "
+            "(pos INTEGER PRIMARY KEY, digest TEXT NOT NULL, sensor INTEGER, ts TEXT)"
+        )
         try:
             for record in iter_records(input_path):
                 if max_rows is not None and rows_total + len(chunks) >= max_rows:
@@ -169,41 +173,81 @@ def _add_cross_chunk_issues(
     last_by_sensor: dict[int, pd.Timestamp],
     config: SensorGuardConfig,
 ) -> None:
-    """Flag duplicate and source-order events spanning chunk boundaries."""
-    issues = batch["issues"].map(lambda value: list(value) if isinstance(value, list) else [])
-    batch["sampling_gap_seconds"] = float("nan")
-    for position, row in batch.iterrows():
-        raw = str(row.get("raw", ""))
+    """Flag cross-chunk duplicates and source-order events using batch operations."""
+    issues = [list(value) if isinstance(value, list) else [] for value in batch["issues"]]
+    gap_values = [float("nan")] * len(batch)
+    raw_values = batch.get("raw", pd.Series([""] * len(batch))).fillna("").astype(str)
+    timestamp_values = pd.to_datetime(batch["timestamp"], errors="coerce")
+    sensor_values = batch["moteid"].to_numpy()
+    stage_rows = []
+    for position, (raw, timestamp, sensor) in enumerate(
+        zip(raw_values, timestamp_values, sensor_values, strict=True)
+    ):
         digest = hashlib.blake2b(raw.encode("utf-8"), digest_size=16).hexdigest()
-        if state.execute("SELECT 1 FROM seen_raw WHERE digest=?", (digest,)).fetchone():
-            issues.at[position].append("duplicate_record")
+        if pd.isna(timestamp) or pd.isna(sensor):
+            stage_rows.append((position, digest, None, None))
         else:
-            state.execute("INSERT INTO seen_raw VALUES (?)", (digest,))
-        timestamp = row.get("timestamp")
-        sensor = row.get("moteid")
-        if timestamp is None or sensor is None or pd.isna(timestamp) or pd.isna(sensor):
-            continue
-        sensor = int(sensor)
-        stamp = pd.Timestamp(timestamp)
-        timestamp_key = stamp.isoformat()
-        exists = state.execute(
-            "SELECT 1 FROM seen_keys WHERE sensor=? AND ts=?", (sensor, timestamp_key)
-        ).fetchone()
-        if exists:
-            issues.at[position].append("duplicate_key")
-        else:
-            state.execute("INSERT INTO seen_keys VALUES (?, ?)", (sensor, timestamp_key))
-        previous = last_by_sensor.get(sensor)
-        if previous is not None:
-            delta = (stamp - previous).total_seconds()
-            if delta < 0:
-                issues.at[position].append("out_of_order")
-            else:
-                batch.at[position, "sampling_gap_seconds"] = delta
-                if delta > config.sampling_gap_seconds:
-                    issues.at[position].append("sampling_gap")
-        last_by_sensor[sensor] = stamp
+            stage_rows.append((position, digest, int(sensor), pd.Timestamp(timestamp).isoformat()))
+
+    state.execute("DELETE FROM batch_records")
+    state.executemany("INSERT INTO batch_records VALUES (?, ?, ?, ?)", stage_rows)
+    duplicate_raw = state.execute(
+        "WITH ranked AS ("
+        " SELECT pos, digest, ROW_NUMBER() OVER (PARTITION BY digest ORDER BY pos) AS rank "
+        " FROM batch_records) "
+        "SELECT pos FROM ranked WHERE rank > 1 "
+        "OR EXISTS (SELECT 1 FROM seen_raw s WHERE s.digest = ranked.digest)"
+    ).fetchall()
+    for (position,) in duplicate_raw:
+        issues[position].append("duplicate_record")
+    state.execute("INSERT OR IGNORE INTO seen_raw SELECT digest FROM batch_records")
+
+    duplicate_keys = state.execute(
+        "WITH ranked AS ("
+        " SELECT pos, sensor, ts, ROW_NUMBER() OVER "
+        " (PARTITION BY sensor, ts ORDER BY pos) AS rank "
+        " FROM batch_records WHERE sensor IS NOT NULL AND ts IS NOT NULL) "
+        "SELECT pos FROM ranked WHERE rank > 1 OR EXISTS ("
+        " SELECT 1 FROM seen_keys s WHERE s.sensor = ranked.sensor AND s.ts = ranked.ts)"
+    ).fetchall()
+    for (position,) in duplicate_keys:
+        issues[position].append("duplicate_key")
+    state.execute(
+        "INSERT OR IGNORE INTO seen_keys "
+        "SELECT sensor, ts FROM batch_records WHERE sensor IS NOT NULL AND ts IS NOT NULL"
+    )
+
+    valid_positions = [
+        pos
+        for pos, (sensor, timestamp) in enumerate(zip(sensor_values, timestamp_values, strict=True))
+        if pd.notna(sensor) and pd.notna(timestamp)
+    ]
+    if valid_positions:
+        valid = pd.DataFrame(
+            {
+                "position": valid_positions,
+                "sensor": [int(sensor_values[pos]) for pos in valid_positions],
+                "timestamp": [pd.Timestamp(timestamp_values.iloc[pos]) for pos in valid_positions],
+            }
+        )
+        for sensor, group in valid.groupby("sensor", sort=False):
+            deltas = group.timestamp.diff().dt.total_seconds().tolist()
+            previous = last_by_sensor.get(int(sensor))
+            if previous is not None:
+                deltas[0] = (group.timestamp.iloc[0] - previous).total_seconds()
+            for position, delta in zip(group.position.tolist(), deltas, strict=True):
+                if pd.isna(delta):
+                    continue
+                if delta < 0:
+                    issues[position].append("out_of_order")
+                else:
+                    gap_values[position] = delta
+                    if delta > config.sampling_gap_seconds:
+                        issues[position].append("sampling_gap")
+            last_by_sensor[int(sensor)] = group.timestamp.iloc[-1]
+
     batch["issues"] = issues
+    batch["sampling_gap_seconds"] = gap_values
     state.commit()
 
 

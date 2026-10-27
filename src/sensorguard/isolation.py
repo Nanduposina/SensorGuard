@@ -27,6 +27,10 @@ class IsolationForestDetector:
         threshold: float | None = None,
         minimum_baseline_rows: int = 20,
         use_contextual_features: bool = False,
+        measurement_features: tuple[str, ...] | None = None,
+        include_time_features: bool = True,
+        use_sensor_baselines: bool = True,
+        include_sensor_id_feature: bool = True,
     ):
         self.contamination = contamination
         self.n_estimators = n_estimators
@@ -34,6 +38,10 @@ class IsolationForestDetector:
         self.threshold = threshold
         self.minimum_baseline_rows = minimum_baseline_rows
         self.use_contextual_features = use_contextual_features
+        self.measurement_features = tuple(measurement_features or FEATURES)
+        self.include_time_features = include_time_features
+        self.use_sensor_baselines = use_sensor_baselines
+        self.include_sensor_id_feature = include_sensor_id_feature
         self.model = None
         self.imputer = None
         self.scaler = None
@@ -46,7 +54,9 @@ class IsolationForestDetector:
             .reset_index(drop=True)
             .sort_values(["timestamp", "sensor_id"], kind="stable")
         )
-        cols = [f for f in FEATURES if f in data]
+        cols = [f for f in self.measurement_features if f in data]
+        if fitting and not cols:
+            raise ValueError("none of the configured measurement features are present")
         numeric = (
             data[cols].apply(pd.to_numeric, errors="coerce").replace([np.inf, -np.inf], np.nan)
         )
@@ -58,7 +68,7 @@ class IsolationForestDetector:
             numeric = pd.concat([numeric, contextual], axis=1)
         if "light" in numeric:
             numeric["light"] = np.log1p(numeric["light"].clip(lower=0))
-        if fitting:
+        if fitting and self.use_sensor_baselines:
             self.baselines = {}
             for sid, g in data.groupby("sensor_id"):
                 if len(g) >= self.minimum_baseline_rows:
@@ -66,20 +76,23 @@ class IsolationForestDetector:
                         self.baselines[(sid, f)] = float(
                             pd.to_numeric(g[f], errors="coerce").median()
                         )
-        for f in cols:
-            baseline = data.sensor_id.map(lambda sid: self.baselines.get((sid, f), np.nan))
-            numeric[f + "_baseline_residual"] = (
-                pd.to_numeric(data[f], errors="coerce").to_numpy() - baseline.to_numpy()
-            )
+        if self.use_sensor_baselines:
+            for f in cols:
+                baseline = data.sensor_id.map(lambda sid: self.baselines.get((sid, f), np.nan))
+                numeric[f + "_baseline_residual"] = (
+                    pd.to_numeric(data[f], errors="coerce").to_numpy() - baseline.to_numpy()
+                )
             # A missing previous observation stays missing and is imputed by training median.
             numeric[f + "_delta"] = pd.to_numeric(
                 data.groupby("sensor_id", sort=False)[f].diff(), errors="coerce"
             ).to_numpy()
-        ts = data.timestamp
-        hour = ts.dt.hour + ts.dt.minute / 60
-        numeric["time_sin"] = np.sin(2 * np.pi * hour / 24)
-        numeric["time_cos"] = np.cos(2 * np.pi * hour / 24)
-        numeric["sensor_id_numeric"] = pd.to_numeric(data.sensor_id, errors="coerce").to_numpy()
+        if self.include_time_features:
+            ts = data.timestamp
+            hour = ts.dt.hour + ts.dt.minute / 60
+            numeric["time_sin"] = np.sin(2 * np.pi * hour / 24)
+            numeric["time_cos"] = np.cos(2 * np.pi * hour / 24)
+        if self.include_sensor_id_feature:
+            numeric["sensor_id_numeric"] = pd.to_numeric(data.sensor_id, errors="coerce").to_numpy()
         if fitting:
             self.feature_names = list(numeric.columns)
         return data, numeric.reindex(columns=self.feature_names) if not fitting else numeric
@@ -114,7 +127,7 @@ class IsolationForestDetector:
         rows = []
         for i, score in enumerate(scores):
             r = data.iloc[i]
-            for f in FEATURES:
+            for f in self.measurement_features:
                 if f in data and pd.notna(r[f]):
                     rows.append(
                         {
