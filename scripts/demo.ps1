@@ -1,7 +1,9 @@
 param(
     [string]$InputPath = "data.txt/data.txt",
     [string]$Python = "python",
-    [int]$Port = 8501
+    [int]$Port = 8501,
+    [string]$OutputDirectory = "artifacts/phase4-demo",
+    [string]$ReviewStorePath = ".sensorguard/phase4-demo.sqlite3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,9 +15,15 @@ if (-not $resolvedInput) {
 
 Push-Location $repoRoot
 try {
-    $outputDir = Join-Path $repoRoot "artifacts/phase4-demo"
+    $outputDir = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $OutputDirectory))
     $experimentDir = Join-Path $outputDir "experiment"
-    $reviewStore = Join-Path $repoRoot ".sensorguard/phase4-demo.sqlite3"
+    $reviewStore = [System.IO.Path]::GetFullPath((Join-Path $repoRoot $ReviewStorePath))
+    if ((Test-Path -LiteralPath $outputDir) -and (Get-ChildItem -LiteralPath $outputDir -Force | Select-Object -First 1)) {
+        throw "Output directory already contains files: $outputDir. Choose a new -OutputDirectory so existing reports are preserved."
+    }
+    if (Test-Path -LiteralPath $reviewStore) {
+        throw "Review database already exists: $reviewStore. Choose a new -ReviewStorePath so existing reviewer decisions are preserved."
+    }
     New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
 
     $source = Get-Item -LiteralPath $resolvedInput.Path

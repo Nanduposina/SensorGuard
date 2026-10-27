@@ -90,3 +90,31 @@ def test_gzip_and_plain_stream(tmp_path):
     with gzip.open(zipped, "wb") as stream:
         stream.write(line)
     assert list(iter_records(plain))[0]["moteid"] == list(iter_records(zipped))[0]["moteid"] == 2
+
+
+def test_clean_export_is_reproducible_and_preserves_all_flagged_rows(tmp_path):
+    import pandas as pd
+
+    from sensorguard.reporting import export_cleaned
+
+    source = pd.DataFrame(
+        [
+            parse_line("2004-02-28 01:00:00 1 55 120 50 9 2.5", line_number=7),
+            parse_line("2004-02-28 01:00:01 2 1 20 50 9 2.5", line_number=8),
+        ]
+    )
+    validated = validate_frame(source)
+    original = validated.copy(deep=True)
+    first = export_cleaned(validated, tmp_path / "first.csv")
+    second = export_cleaned(validated, tmp_path / "second.csv")
+
+    assert validated.equals(original)
+    first_text = first.read_text(encoding="utf-8")
+    assert first_text == second.read_text(encoding="utf-8")
+    restored = pd.read_csv(first)
+    assert len(restored) == len(source)
+    assert restored.line_number.tolist() == [7, 8]
+    assert restored.raw.tolist() == source.raw.tolist()
+    assert restored.iloc[0].moteid == 55
+    assert "invalid_sensor_id" in restored.iloc[0].issues
+    assert "suspicious_temperature" in restored.iloc[0].issues
