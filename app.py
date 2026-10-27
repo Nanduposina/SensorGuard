@@ -49,15 +49,25 @@ st.set_page_config(
 st.markdown(
     """
 <style>
-.stApp { background: #f5f7fa; color: #172b4d; }
+:root { color-scheme: light; }
+.stApp, [data-testid="stAppViewContainer"] { background: #f5f7fa; color: #172b4d; --text-color: #172b4d; --secondary-text-color: #475569; }
 [data-testid="stHeader"] { background: #f5f7fa; }
 [data-testid="stSidebar"] { background: #edf2f7; border-right: 1px solid #dbe3ec; color: #172b4d; }
 [data-testid="stSidebar"] p, [data-testid="stSidebar"] label, [data-testid="stSidebar"] span { color: #172b4d !important; }
-h1,h2,h3 { color: #17324d; letter-spacing: -0.02em; }
+.stApp h1, .stApp h2, .stApp h3 { color: #17324d; letter-spacing: -0.02em; }
+.stApp [data-testid="stMarkdownContainer"], .stApp [data-testid="stMarkdownContainer"] p,
+.stApp [data-testid="stCaptionContainer"], .stApp [data-testid="stText"],
+.stApp [data-testid="stWidgetLabel"], .stApp [data-testid="stWidgetLabel"] p,
+.stApp [data-testid="stCheckbox"] label, .stApp [data-testid="stRadio"] label,
+.stApp [data-testid="stSelectbox"] label, .stApp [data-testid="stMultiSelect"] label,
+.stApp [data-testid="stDateInput"] label, .stApp [data-testid="stNumberInput"] label,
+.stApp [data-testid="stTextInput"] label, .stApp [data-testid="stSlider"] label,
+.stApp [data-testid="stButton"] button, .stApp [role="tab"] { color: #172b4d !important; }
 [data-testid="stMetric"] { background: white; border: 1px solid #dbe3ec; padding: 14px 16px; border-radius: 10px; color: #172b4d; }
 [data-testid="stMetricLabel"], [data-testid="stMetricValue"], [data-testid="stMetricDelta"] { color: #172b4d !important; }
-.sg-note { background: #eaf3f7; border-left: 4px solid #168c8c; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
-.sg-warn { background: #fff5e5; border-left: 4px solid #d58c22; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
+.stApp [data-testid="stDataFrame"] [role="grid"], .stApp [data-testid="stTable"] { color: #172b4d; }
+.sg-note { background: #eaf3f7; color: #172b4d; border-left: 4px solid #168c8c; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
+.sg-warn { background: #fff5e5; color: #543b17; border-left: 4px solid #d58c22; padding: 12px 16px; border-radius: 6px; margin: 8px 0 16px; }
 </style>
 """,
     unsafe_allow_html=True,
