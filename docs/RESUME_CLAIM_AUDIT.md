@@ -65,11 +65,44 @@ The run used 55 normal training vehicles, 18 disjoint normal validation vehicles
 | Isolation Forest | 0 | 9 | 0 | 18 | 0.000 | 0.000 | 0.000 | 0.000 |
 | Autoencoder | 4 | 5 | 4 | 14 | 0.500 | 0.444 | 0.471 | 0.222 |
 
-The denominator for the external false-positive rate is 18 held-out vehicles labelled normal by the study. These are vehicle-level outcomes; no timestamped fault onset or snippet-level label exists, so the project does not claim an event-level detection delay or false alarms per valid reading. The source has only nine fault-labelled vehicles in this subset, and this test is not evidence of transfer to Intel Lab sensor motes. For reproduction, run `python scripts/evaluate_real_battery.py <extracted-brand3-directory> --archive <brand3.tar.gz> --output-dir <new-artifact-dir> --seed 42 --epochs 20 --estimators 200 --threshold-quantile 0.95`.
+The denominator for the external false-positive rate is 18 held-out vehicles carrying the study's vehicle-level normal label. It is a false-alarm rate on labelled-normal vehicles, not on individual readings. The paper says labels were assigned case-by-case from driver reports and engineer confirmation of lithium plating, low electric range, over-high temperature, or unexpected voltage behavior. The released CSV has one binary label per vehicle; charging snippets carry vehicle, mileage, segment, and source filename but no independent per-snippet labels. The paper also says data at or near battery failures were removed. It provides no exact failure timestamp, faulty-session label, event boundary, or independently verified normal-reading interval. Consequently, vehicle-level false alarms are measurable here, while reading-level false alarms and event detection delay are not. The brand 3 subset contains only nine fault-labelled vehicles, and this result does not validate transfer to Intel Lab motes. For reproduction, run `python scripts/evaluate_real_battery.py <extracted-brand3-directory> --archive <brand3.tar.gz> --output-dir <new-artifact-dir> --seed 42 --epochs 20 --estimators 200 --threshold-quantile 0.95`.
 
 The separate Zenodo/2025 publication also describes real BMS fault classes whose labels were assigned after pack disassembly, but its GIS archive has no accompanying ID-to-label manifest that could be matched for this adapter. It was therefore not used to calculate project metrics.
 
 No independently verified battery hardware failures, maintenance records, or battery replacement labels are present for Intel Lab in the repository or official dataset. External literature does provide retrospective fault interpretations: [Ni (2008), Figure 2.10](https://gregorypottielab.org/theses/kevin-thesis.pdf) marks an approximate voltage below which two nearby, unnamed Intel Lab motes begin to fail; [Sharma et al. (2007)](https://escholarship.org/uc/item/31f765tj) describe Intel Lab temperature faults correlated with supply voltage becoming insufficient; and [Scholl et al. (2023), Section 3.7](https://pmc.ncbi.nlm.nih.gov/articles/PMC10140861/) discuss voltage-drop effects in motes 46–48. These publications are useful evidence that voltage-related sensor degradation has been suspected in this dataset, but they do not provide battery service/replacement ground truth, and the first source does not provide mote IDs or exact event times. They cannot support observation-level supervised Intel Lab metrics. The official documentation says voltage variation is strongly correlated with temperature and that these lithium-ion cells generally maintain fairly constant voltage. The full streaming investigation evaluated 299 seven-day sensor windows; 296 crossed its exploratory adjusted-slope cutoff of −0.005 V/day. This unusually broad screen is evidence that the candidate rule is not specific enough to diagnose failures, not evidence of 296 battery events. Temperature-adjusted declines remain observational candidates: the linear adjustment is not causal and load, shared environmental/time effects, calibration, sampling gaps, or truncation can explain patterns. No Intel event-level precision or recall is supportable.
+
+## Final ground-truth evaluation reproduction (2026-10-27)
+
+The published source is Zhang et al., [Nature Communications 14, 5940 (2023)](https://doi.org/10.1038/s41467-023-41226-5), with the processed data at [Figshare DOI 10.6084/m9.figshare.23659323](https://doi.org/10.6084/m9.figshare.23659323). The paper's data-availability and label descriptions were checked directly. Label granularity in the released brand 3 subset is:
+
+| Evidence type | Present? | What the source supports |
+|---|---|---|
+| Published fault-labelled vehicles | Yes | Vehicle labels were based on driver reports and engineer confirmation of battery-related indications (including lithium plating, low electric range, over-temperature, or unexpected voltage behavior); the public binary CSV does not give per-vehicle fault subtype. |
+| Published normal-labelled vehicles | Yes, at vehicle level | The study describes these as vehicles without Li-ion battery faults. That label does not independently verify every interval or charging snippet. |
+| Battery-failure timestamps / event boundaries | No | The processed release has no event dates or onset/clearance times; the paper says data at or near failure were removed. |
+| Individually labelled faulty charging sessions / abnormal readings | No | Segment files retain vehicle and mileage metadata, not per-session or per-reading ground truth. |
+| Independently verified normal-reading intervals | No | Vehicle-level normal labels are too coarse to certify each reading as normal. |
+
+Thus the external evidence supports a vehicle-level evaluation on published fault and normal vehicle labels, but not timestamped physical battery interventions. It does **not** establish that every segment from a normal-labelled vehicle is independently verified normal, nor that every segment from a fault-labelled vehicle is faulty. No stronger per-reading label granularity was found in the released brand 3 files.
+
+A fresh run used the already downloaded archive, without modifying source data:
+
+```powershell
+$dataset = Join-Path (Join-Path $env:TEMP 'sensorguard-ev-battery-study-20261027\extract') 'battery_brand3'
+$archive = Join-Path (Join-Path $env:TEMP 'sensorguard-ev-battery-study-20261027') 'battery_brand3-retry.tar.gz'
+.venv/Scripts/python.exe scripts/evaluate_real_battery.py $dataset --output-dir artifacts/phase7-real-battery-reproduce-20261027 --archive $archive --seed 42 --epochs 20 --estimators 200 --threshold-quantile 0.95
+```
+
+Exit code: 0; elapsed 74.12 seconds. Archive SHA-256: `afb5fb2a762cceb5627c112ed2d8d981590274e7f44239321d64384e317b4fd0`. Source label counts: 100 vehicles (9 fault, 91 normal) and 29,598 charging snippets. Vehicle IDs are disjoint across 55 training, 18 validation, and 27 test vehicles (all nine fault-labelled vehicles plus 18 normal-labelled vehicles). Model fitting used 10,432 early-mileage training segments; validation used 1,120 later segments; test used 1,827 later segments. Thresholds were the 95th percentile of validation-normal vehicle scores only: Isolation Forest 0.6868386495; autoencoder 0.1605815529.
+
+| Detector | TP fault vehicles | FN fault vehicles | FP labelled-normal vehicles | TN labelled-normal vehicles | Precision | Recall | F1 | Vehicle-level FPR |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Isolation Forest | 0 | 9 | 0 | 18 | 0.000 | 0.000 | 0.000 | 0.000 |
+| Autoencoder | 4 | 5 | 4 | 14 | 0.500 | 0.444 | 0.471 | 0.222 |
+
+The Isolation Forest result is reproducible under the prespecified validation threshold and is not explained by score-row misalignment: its score association is keyed by unique source filename and has a regression test. For diagnosis after fixing the threshold, the held-out fault-vehicle scores ranged from 0.604362 to 0.646364, below the cutoff 0.686839; the maximum score among the 18 normal-labelled test vehicles was 0.669770. The score ranking still had overlap (post-hoc test AUROC 0.7778), so the zero detections reflect the validation-calibrated cutoff not transferring to any test score, rather than all fault vehicles receiving the lowest scores. The autoencoder post-hoc test AUROC was 0.8272. These small-sample AUROCs are descriptive only; they did not affect threshold selection. No test-label threshold tuning was performed.
+
+Generated, ignored evidence is in `artifacts/phase7-real-battery-reproduce-20261027/`: metadata (including archive hash and all split IDs), detector metrics, per-vehicle scores/predictions, and a report. This reproduces vehicle-level detection and false alarms on source-labelled-normal vehicles. It does not support reading-level false-alarm claims, because the paper does not label normal intervals or individual charging snippets. Synthetic Intel Lab injections remain a separate evaluation track.
 
 ## Remaining scope and release state
 
